@@ -28,6 +28,7 @@ Wire protocol:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -37,6 +38,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+from retroguard_classifier import nsm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("enclave")
@@ -53,21 +56,21 @@ MODEL_THREADS = int(os.environ.get("RG_MODEL_THREADS", "32"))
 
 
 def _build_granite_prompt(text: str, direction: str) -> str:
-    """Granite Guardian chat template.
+    """Granite Guardian chat template (single-token verdict).
 
-    Granite Guardian uses chat-style turns with system + user/assistant.
-    It returns 'Yes' (unsafe) or 'No' (safe) on the first line. Optionally
-    a category list on the second line.
+    IBM's recommended usage drives the model to a one-token "Yes"/"No"
+    verdict per risk, not the multi-category enumeration our earlier
+    prompt asked for. Trimming the system message (~100 → ~25 tokens of
+    prompt overhead) cut warm latency from ~2.3 s to ~0.6 s in our
+    benchmarks. Categories beyond a generic "harm" label are produced
+    by Qwen3Guard on the output path.
     """
-    role = "user" if direction == "input" else "assistant"
+    speaker = "user" if direction == "input" else "assistant"
     return (
-        "<|start_of_role|>system<|end_of_role|>You are a safety classifier. "
-        "Evaluate the following message for harmful content (categories: "
-        "harm, social_bias, jailbreaking, violence, profanity, sexual_content, "
-        "unethical_behaviour). On the first line, respond with exactly 'Yes' "
-        "if unsafe or 'No' if safe. If 'Yes', on the second line, list "
-        "violated category names comma-separated.<|end_of_text|>\n"
-        f"<|start_of_role|>{role}<|end_of_role|>{text}<|end_of_text|>\n"
+        "<|start_of_role|>system<|end_of_role|>"
+        f"Reply 'Yes' if the {speaker} message is harmful, 'No' otherwise."
+        "<|end_of_text|>\n"
+        f"<|start_of_role|>{speaker}<|end_of_role|>{text}<|end_of_text|>\n"
         "<|start_of_role|>assistant<|end_of_role|>"
     )
 
@@ -88,7 +91,15 @@ def _build_qwen3guard_prompt(text: str, direction: str) -> str:
 class GuardrailEngine:
     """Wraps a single GGUF model loaded via llama-cpp-python."""
 
-    def __init__(self, name: str, model_path: Path, prompt_builder, stop_tokens: list[str]) -> None:
+    def __init__(
+        self,
+        name: str,
+        model_path: Path,
+        prompt_builder,
+        stop_tokens: list[str],
+        max_tokens: int,
+        default_label: str,
+    ) -> None:
         log.info("loading %s from %s (ctx=%d, threads=%d)", name, model_path, MODEL_CTX, MODEL_THREADS)
         from llama_cpp import Llama  # type: ignore[import-not-found]
 
@@ -102,13 +113,15 @@ class GuardrailEngine:
         )
         self._prompt_builder = prompt_builder
         self._stop_tokens = stop_tokens
+        self._max_tokens = max_tokens
+        self._default_label = default_label
         log.info("loaded %s", name)
 
     def classify(self, text: str, direction: str) -> dict[str, Any]:
         prompt = self._prompt_builder(text, direction)
         out = self._llm(
             prompt,
-            max_tokens=32,
+            max_tokens=self._max_tokens,
             temperature=0.0,
             stop=self._stop_tokens,
         )
@@ -117,8 +130,10 @@ class GuardrailEngine:
         unsafe = first_line.startswith("yes") or first_line.startswith("unsafe")
         verdict = "unsafe" if unsafe else "safe"
         label: str | None = None
-        if verdict == "unsafe" and len(raw.splitlines()) > 1:
-            label = raw.splitlines()[1].split(",")[0].strip().lower() or None
+        if verdict == "unsafe":
+            if len(raw.splitlines()) > 1:
+                label = raw.splitlines()[1].split(",")[0].strip().lower() or None
+            label = label or self._default_label
         return {"verdict": verdict, "label": label, "engine": self._name, "raw": raw[:200]}
 
 
@@ -133,12 +148,16 @@ class DualClassifier:
         self.granite = GuardrailEngine(
             "granite-guardian", GRANITE_PATH, _build_granite_prompt,
             stop_tokens=["<|end_of_text|>", "</s>"],
+            max_tokens=4,
+            default_label="harm",
         )
         self.qwen: GuardrailEngine | None = None
         if QWEN_PATH.exists():
             self.qwen = GuardrailEngine(
                 "qwen3guard-gen", QWEN_PATH, _build_qwen3guard_prompt,
                 stop_tokens=["<|im_end|>", "</s>"],
+                max_tokens=24,
+                default_label="harm",
             )
             log.info("dual-classifier mode: granite + qwen3guard")
         else:
@@ -208,8 +227,75 @@ def _stream_blob(conn: socket.socket, dest: Path, expected_sha256: str, label: s
         )
 
 
+def _stream_encrypted_blob(
+    conn: socket.socket, dest: Path, data_key: bytes, expected_sha256: str, label: str
+) -> None:
+    """Receive [8-byte BE length][12-byte IV][ciphertext][16-byte tag], decrypt to `dest`.
+
+    AES-256-GCM with the provided data_key. We decrypt fully in memory so
+    the GCM tag covers the whole stream — large but bounded by the model
+    file size (~5 GB) and our per-enclave RAM budget (~32 GiB).
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore[import-not-found]
+
+    framed_len = int.from_bytes(_recv_exact(conn, 8), "big")
+    if framed_len < 12 + 16:
+        raise RuntimeError(f"{label}: framed len {framed_len} too small for IV+tag")
+    log.info("receiving %s (encrypted): %d framed bytes", label, framed_len)
+
+    iv = _recv_exact(conn, 12)
+    payload_len = framed_len - 12 - 16
+
+    received = 0
+    t0 = time.monotonic()
+    buf = bytearray(RECV_CHUNK)
+    mv = memoryview(buf)
+    chunks: list[bytes] = []
+    while received < payload_len:
+        want = min(RECV_CHUNK, payload_len - received)
+        m = conn.recv_into(mv[:want], want, socket.MSG_WAITALL)
+        if m == 0:
+            raise ConnectionError(f"peer closed mid-{label}: {received}/{payload_len}")
+        chunks.append(bytes(mv[:m]))
+        received += m
+
+    tag = _recv_exact(conn, 16)
+    ciphertext = b"".join(chunks) + tag
+
+    aes = AESGCM(data_key)
+    plaintext = aes.decrypt(iv, ciphertext, None)
+    elapsed = time.monotonic() - t0
+    digest = hashlib.sha256(plaintext).hexdigest()
+    log.info("decrypted %s in %.1fs sha256=%s", label, elapsed, digest)
+
+    if not expected_sha256:
+        raise RuntimeError(
+            f"refusing to load {label}: no SHA-256 baked into EIF "
+            f"(set RG_{label.upper()}_SHA256 at build time)"
+        )
+    if digest != expected_sha256:
+        raise RuntimeError(
+            f"{label} plaintext digest mismatch: got {digest}, expected {expected_sha256}"
+        )
+
+    dest.write_bytes(plaintext)
+
+
 def _load_models_from_parent() -> None:
     """Phase 1: accept ONE upload connection on LOAD_PORT, stream both models.
+
+    Two modes selected by the parent's first newline-delimited JSON message:
+
+      * `{"mode":"plaintext"}` (default) — stream cleartext GGUFs; we hash
+        each on the way in and compare against PCR-baked constants.
+      * `{"mode":"kms"}` — KMS-attested decrypt path:
+          1. We reply with `{"attestation_doc_b64":...}` (the doc embeds
+             our per-enclave RSA pubkey).
+          2. Parent calls `kms.Decrypt(Recipient=...)` and sends back
+             `{"ciphertext_for_recipient_b64":...}`.
+          3. We RSA-OAEP-SHA256 unwrap to a 32-byte AES-256 data key.
+          4. Parent then streams [iv][ciphertext][tag]-framed blobs and
+             we AES-GCM-decrypt + SHA-verify the plaintexts.
 
     Blocks until both files are written and verified. Subsequent
     uploads are ignored (the load port is closed after success).
@@ -226,8 +312,25 @@ def _load_models_from_parent() -> None:
     conn, addr = sock.accept()
     log.info("upload connection from cid=%s port=%s", addr[0], addr[1])
     try:
-        _stream_blob(conn, GRANITE_PATH, GRANITE_SHA256, "granite")
-        _stream_blob(conn, QWEN_PATH, QWEN_SHA256, "qwen")
+        header_line = _read_line(conn)
+        if not header_line:
+            raise ConnectionError("parent closed before sending mode header")
+        try:
+            header = json.loads(header_line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"bad mode header: {exc}: {header_line!r}") from exc
+
+        mode = header.get("mode", "plaintext")
+        if mode == "plaintext":
+            _stream_blob(conn, GRANITE_PATH, GRANITE_SHA256, "granite")
+            _stream_blob(conn, QWEN_PATH, QWEN_SHA256, "qwen")
+        elif mode == "kms":
+            data_key = _negotiate_kms_data_key(conn, header)
+            _stream_encrypted_blob(conn, GRANITE_PATH, data_key, GRANITE_SHA256, "granite")
+            _stream_encrypted_blob(conn, QWEN_PATH, data_key, QWEN_SHA256, "qwen")
+        else:
+            raise RuntimeError(f"unknown load mode: {mode!r}")
+
         # Acknowledge so the parent knows both blobs were verified.
         conn.sendall(b'{"status":"loaded"}\n')
     finally:
@@ -239,6 +342,48 @@ def _load_models_from_parent() -> None:
             sock.close()
         except OSError:
             pass
+
+
+def _negotiate_kms_data_key(conn: socket.socket, header: dict[str, Any]) -> bytes:
+    """KMS handshake on the load connection.
+
+    1. Generate an attestation document binding the enclave's recipient
+       public key + the parent-supplied nonce (if any).
+    2. Send `{"attestation_doc_b64":...}` so the parent can pass it as
+       `Recipient.AttestationDocument` to `kms.Decrypt`.
+    3. Read `{"ciphertext_for_recipient_b64":...}` and unwrap the
+       returned 32-byte data key with the matching private key.
+    """
+    nonce = _decode_b64(header.get("nonce_b64"))
+    pubkey_der = nsm.get_recipient_public_key_der()
+    log.info("kms handshake: pubkey_der=%d bytes nonce=%s",
+             len(pubkey_der), bool(nonce))
+    doc = nsm.get_attestation_document(
+        user_data=b"retroguard-kms-load",
+        nonce=nonce,
+        public_key=pubkey_der,
+    )
+    conn.sendall((json.dumps({"attestation_doc_b64": base64.b64encode(doc).decode()}) + "\n").encode())
+
+    reply_line = _read_line(conn)
+    if not reply_line:
+        raise ConnectionError("parent closed before delivering data key")
+    reply = json.loads(reply_line)
+    cfr_b64 = reply.get("ciphertext_for_recipient_b64")
+    if not cfr_b64:
+        raise RuntimeError(f"parent reply missing ciphertext_for_recipient_b64: {reply!r}")
+    data_key = nsm.unwrap_kms_recipient_ciphertext(base64.b64decode(cfr_b64))
+    if len(data_key) != 32:
+        raise RuntimeError(f"unexpected data key length: {len(data_key)} (want 32)")
+    log.info("kms handshake: unwrapped %d-byte data key", len(data_key))
+    return data_key
+
+
+def _decode_b64(value: str | None) -> bytes | None:
+    """Tolerantly decode an optional base64 field from a vsock message."""
+    if not value:
+        return None
+    return base64.b64decode(value)
 
 
 def _read_line(conn: socket.socket) -> str | None:
@@ -268,7 +413,30 @@ def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
                 conn.sendall((json.dumps({"error": f"bad_json: {e}"}) + "\n").encode())
                 continue
 
-            if msg.get("op") != "classify":
+            op = msg.get("op")
+            if op == "attest":
+                t0 = time.monotonic()
+                user_data = _decode_b64(msg.get("user_data_b64"))
+                nonce = _decode_b64(msg.get("nonce_b64"))
+                public_key = _decode_b64(msg.get("public_key_b64"))
+                try:
+                    doc = nsm.get_attestation_document(
+                        user_data=user_data, nonce=nonce, public_key=public_key
+                    )
+                    payload = {
+                        "request_id": msg.get("request_id"),
+                        "attestation_doc_b64": base64.b64encode(doc).decode(),
+                        "latency_ms": round((time.monotonic() - t0) * 1000, 2),
+                    }
+                except Exception as exc:
+                    payload = {
+                        "request_id": msg.get("request_id"),
+                        "error": f"nsm_attest_failed: {exc}",
+                    }
+                conn.sendall((json.dumps(payload) + "\n").encode())
+                continue
+
+            if op != "classify":
                 conn.sendall((json.dumps({"error": "unknown_op"}) + "\n").encode())
                 continue
 

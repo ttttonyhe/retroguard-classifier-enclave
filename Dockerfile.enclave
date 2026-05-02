@@ -23,8 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Granite Guardian 4.1 ships with the 'granite-docling' pre-tokenizer,
 # which only landed in llama.cpp / llama-cpp-python in 0.3.20+. Pin to
-# the latest stable so both Granite 4.1 and Qwen3Guard load.
-RUN pip install --no-cache-dir llama-cpp-python==0.3.21
+# the latest stable so both Granite 4.1 and Qwen3Guard load. cbor2 is
+# used by the /dev/nsm wrapper for attestation requests.
+RUN pip install --no-cache-dir llama-cpp-python==0.3.21 cbor2==5.6.5 cryptography==44.0.0
 
 COPY src/ /app/src/
 
