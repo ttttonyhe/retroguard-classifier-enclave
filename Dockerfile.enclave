@@ -27,16 +27,20 @@ RUN pip install --no-cache-dir llama-cpp-python==0.3.6
 # Stage the in-enclave server code
 COPY src/ /app/src/
 
-# Model: pulled at build time. v1 uses Meta's Llama Guard 3 8B (Q4_K_M
-# quantization, ~5GB) which is a safety classifier specifically trained
-# for unsafe content detection. Public mirror via QuantFactory (no
-# HuggingFace token required). When a HuggingFace token is provided
-# at build time, swap to ibm-granite/granite-guardian-4.1-8b-gguf for
-# the spec-aligned model.
-ARG MODEL_URL=https://huggingface.co/QuantFactory/Llama-Guard-3-8B-GGUF/resolve/main/Llama-Guard-3-8B.Q4_K_M.gguf
+# Model: pulled at build time. v1 default = Granite Guardian 4.1 8B
+# (Q4_K_M ~5GB). The IBM HuggingFace repo is gated; pass HF_TOKEN at
+# build time. Override MODEL_URL to use any other GGUF guardrail
+# (e.g. QuantFactory/Llama-Guard-3-8B-GGUF for a public alternative).
+ARG HF_TOKEN
+ARG MODEL_URL=https://huggingface.co/ibm-granite/granite-guardian-4.1-8b-gguf/resolve/main/granite-guardian-4.1-8b-Q4_K_M.gguf
 RUN mkdir -p /opt/models && \
-    curl -L -o /opt/models/guardrail.gguf "$MODEL_URL" && \
-    ls -lh /opt/models/
+    if [ -n "$HF_TOKEN" ]; then \
+      curl -L -H "Authorization: Bearer $HF_TOKEN" -o /opt/models/guardrail.gguf "$MODEL_URL"; \
+    else \
+      curl -L -o /opt/models/guardrail.gguf "$MODEL_URL"; \
+    fi && \
+    ls -lh /opt/models/ && \
+    [ "$(stat -c%s /opt/models/guardrail.gguf)" -gt 1000000 ] || (echo "Model download failed (file too small — likely auth error)" >&2 && exit 1)
 
 ENV PYTHONPATH=/app/src \
     RG_MODEL_PATH=/opt/models/guardrail.gguf \
