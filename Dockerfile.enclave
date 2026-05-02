@@ -27,16 +27,19 @@ RUN pip install --no-cache-dir llama-cpp-python==0.3.6
 # Stage the in-enclave server code
 COPY src/ /app/src/
 
-# Model: pulled at build time. The HuggingFace URL pattern for the
-# IBM Granite Guardian GGUF release. Build arg lets us swap variants
-# (Q4_K_M is the v1 default; Q5_K_M = better quality, +800MB).
-ARG MODEL_REVISION=Q4_K_M
-ARG MODEL_URL=https://huggingface.co/ibm-granite/granite-guardian-4.1-8b-gguf/resolve/main/granite-guardian-4.1-8b-${MODEL_REVISION}.gguf
+# Model: pulled at build time. v1 uses Meta's Llama Guard 3 8B (Q4_K_M
+# quantization, ~5GB) which is a safety classifier specifically trained
+# for unsafe content detection. Public mirror via QuantFactory (no
+# HuggingFace token required). When a HuggingFace token is provided
+# at build time, swap to ibm-granite/granite-guardian-4.1-8b-gguf for
+# the spec-aligned model.
+ARG MODEL_URL=https://huggingface.co/QuantFactory/Llama-Guard-3-8B-GGUF/resolve/main/Llama-Guard-3-8B.Q4_K_M.gguf
 RUN mkdir -p /opt/models && \
-    curl -L -o /opt/models/granite-guardian.gguf "$MODEL_URL"
+    curl -L -o /opt/models/guardrail.gguf "$MODEL_URL" && \
+    ls -lh /opt/models/
 
 ENV PYTHONPATH=/app/src \
-    RG_MODEL_PATH=/opt/models/granite-guardian.gguf \
+    RG_MODEL_PATH=/opt/models/guardrail.gguf \
     RG_VSOCK_PORT=5005 \
     RG_MODEL_CTX=4096 \
     RG_MODEL_THREADS=32

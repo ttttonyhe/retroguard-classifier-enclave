@@ -42,19 +42,32 @@ MODEL_THREADS = int(os.environ.get("RG_MODEL_THREADS", "32"))
 
 
 def _build_classifier_prompt(text: str, direction: str) -> str:
-    """Granite Guardian classifier prompt template.
+    """Llama Guard 3 prompt template.
 
-    Granite Guardian expects a chat-style prompt with the user message
-    being the content under evaluation; the response is `safe`/`unsafe`
-    with optional category labels.
+    Llama Guard expects a structured prompt with safety categories
+    enumerated and the message under evaluation marked as User/Agent.
+    Output is two lines: `safe` or `unsafe\\nS<n>` where Sn is the
+    violated category code.
     """
-    role = "user" if direction == "input" else "assistant"
+    role = "User" if direction == "input" else "Agent"
     return (
-        "You are a safety classifier. Evaluate the following message for harmful "
-        "content (categories: harm, jailbreaking, violence, social_bias). Respond "
-        "with exactly one word: `safe` or `unsafe`.\n\n"
-        f"<{role}>\n{text}\n</{role}>\n\n"
-        "Verdict:"
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"Task: Check if there is unsafe content in '{role}' messages in conversations "
+        "according our safety policy with the below categories.\n\n"
+        "<BEGIN UNSAFE CONTENT CATEGORIES>\n"
+        "S1: Violent Crimes.\nS2: Non-Violent Crimes.\nS3: Sex Crimes.\n"
+        "S4: Child Exploitation.\nS5: Defamation.\nS6: Specialized Advice.\n"
+        "S7: Privacy.\nS8: Intellectual Property.\nS9: Indiscriminate Weapons.\n"
+        "S10: Hate.\nS11: Self-Harm.\nS12: Sexual Content.\nS13: Elections.\n"
+        "S14: Code Interpreter Abuse.\n"
+        "<END UNSAFE CONTENT CATEGORIES>\n\n"
+        "<BEGIN CONVERSATION>\n\n"
+        f"{role}: {text}\n\n"
+        "<END CONVERSATION>\n\n"
+        f"Provide your safety assessment for ONLY THE LAST {role} message in the above conversation:\n"
+        "- First line must read 'safe' or 'unsafe'.\n"
+        "- If unsafe, a second line must include a comma-separated list of violated categories.<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n\n"
     )
 
 
@@ -78,15 +91,39 @@ class GraniteGuardianClassifier:
         prompt = _build_classifier_prompt(text, direction)
         out = self._llm(
             prompt,
-            max_tokens=8,
+            max_tokens=24,
             temperature=0.0,
-            stop=["\n", "."],
+            stop=["<|eot_id|>"],
         )
-        verdict_raw = (out.get("choices", [{}])[0].get("text") or "").strip().lower()
-        verdict = "unsafe" if "unsafe" in verdict_raw else "safe"
-        # v1 doesn't extract per-category labels yet; that lands when we
-        # wire the structured-output template per spec §6.
-        return {"verdict": verdict, "label": "general" if verdict == "unsafe" else None}
+        raw = (out.get("choices", [{}])[0].get("text") or "").strip()
+        first_line = raw.splitlines()[0].strip().lower() if raw else ""
+        verdict = "unsafe" if first_line.startswith("unsafe") else "safe"
+        # Llama Guard emits violated category codes (S1..S14) on the
+        # second line. Map back to spec §6 builtin_categories names where
+        # we have a 1:1 mapping; otherwise return the raw S-code.
+        label: str | None = None
+        if verdict == "unsafe" and len(raw.splitlines()) > 1:
+            codes = [c.strip().upper() for c in raw.splitlines()[1].split(",")]
+            label = LLAMA_GUARD_CATEGORY_MAP.get(codes[0], codes[0]) if codes else None
+        return {"verdict": verdict, "label": label, "raw": raw}
+
+
+LLAMA_GUARD_CATEGORY_MAP: dict[str, str] = {
+    "S1": "violence",
+    "S2": "harm",
+    "S3": "sexual_content",
+    "S4": "harm",
+    "S5": "harm",
+    "S6": "harm",
+    "S7": "harm",
+    "S8": "harm",
+    "S9": "violence",
+    "S10": "social_bias",
+    "S11": "harm",
+    "S12": "sexual_content",
+    "S13": "harm",
+    "S14": "jailbreaking",
+}
 
 
 def _read_line(conn: socket.socket) -> str | None:
