@@ -312,7 +312,13 @@ def _load_models_from_parent() -> None:
     conn, addr = sock.accept()
     log.info("upload connection from cid=%s port=%s", addr[0], addr[1])
     try:
-        header_line = _read_line(conn)
+        # IMPORTANT: read the JSON header byte-by-byte. _read_line() buffers
+        # in 4 KiB chunks and silently drops anything past the newline — that
+        # would eat the 8-byte length prefix (and the start of the GGUF) and
+        # the next read would interpret model bytes as a length, hanging on
+        # an exabyte-sized recv. The header is small (< 200 B), so the
+        # per-byte recv cost is irrelevant.
+        header_line = _read_line_byte(conn)
         if not header_line:
             raise ConnectionError("parent closed before sending mode header")
         try:
@@ -355,7 +361,7 @@ def _negotiate_kms_data_key(conn: socket.socket, header: dict[str, Any]) -> byte
        returned 32-byte data key with the matching private key.
     """
     nonce = _decode_b64(header.get("nonce_b64"))
-    pubkey_der = nsm.get_recipient_public_key_der()
+    pubkey_der = nsm.get_recipient_public_key_der()  # type: ignore[attr-defined]
     log.info("kms handshake: pubkey_der=%d bytes nonce=%s",
              len(pubkey_der), bool(nonce))
     doc = nsm.get_attestation_document(
@@ -365,7 +371,7 @@ def _negotiate_kms_data_key(conn: socket.socket, header: dict[str, Any]) -> byte
     )
     conn.sendall((json.dumps({"attestation_doc_b64": base64.b64encode(doc).decode()}) + "\n").encode())
 
-    reply_line = _read_line(conn)
+    reply_line = _read_line_byte(conn)
     if not reply_line:
         raise ConnectionError("parent closed before delivering data key")
     reply = json.loads(reply_line)
@@ -387,7 +393,14 @@ def _decode_b64(value: str | None) -> bytes | None:
 
 
 def _read_line(conn: socket.socket) -> str | None:
-    """Read a newline-delimited message from a stream socket."""
+    """Read a newline-delimited message from a stream socket.
+
+    NB: this WILL over-read past the newline (chunks of up to 4 KiB), so
+    only safe on a request/reply protocol where the rest of the buffer
+    can be discarded. For the `_load_models_from_parent` handshake (where
+    a length-prefixed binary blob follows the JSON header on the same
+    connection) use _read_line_byte() instead.
+    """
     chunks: list[bytes] = []
     while True:
         b = conn.recv(4096)
@@ -399,6 +412,24 @@ def _read_line(conn: socket.socket) -> str | None:
     data = b"".join(chunks)
     line, _, _ = data.partition(b"\n")
     return line.decode("utf-8", errors="replace")
+
+
+def _read_line_byte(conn: socket.socket) -> str | None:
+    """Read a newline-delimited message one byte at a time.
+
+    Slow but correct: leaves any subsequent bytes on the socket so a
+    follow-up _recv_exact() / recv_into() reads them as expected. Use
+    this whenever the next message on the wire is a binary blob.
+    """
+    out = bytearray()
+    while True:
+        b = conn.recv(1)
+        if not b:
+            return None
+        if b == b"\n":
+            break
+        out.extend(b)
+    return out.decode("utf-8", errors="replace")
 
 
 def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
