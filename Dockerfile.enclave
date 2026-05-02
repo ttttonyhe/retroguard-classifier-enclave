@@ -1,12 +1,12 @@
 # In-enclave classifier — runs INSIDE the Nitro Enclave.
 # Built into an EIF via `nitro-cli build-enclave --docker-uri ...`.
 #
-# Layout choice: we bake the GGUF model weights into the image so the
-# EIF is self-contained on first boot. v2 will pull from S3 + decrypt
-# via KMS attestation per spec §5 Tree 2.
-#
-# Model: ibm-granite/granite-guardian-4.1-8b-gguf (Q4_K_M ~5GB).
-# Inference: llama-cpp-python (CPU-only; matches AWS sample).
+# Model loading: NOT baked here. The 8B Q4_K_M dual-model bundle is
+# ~10GB which exceeds nitro-cli 1.4.4's effective initramfs ceiling
+# (cpio decompression fails ~5GB+). The parent streams Granite +
+# Qwen3Guard over vsock at boot; the enclave verifies each blob's
+# SHA-256 against the constants below — and PCR0 measures those
+# constants, so a tampered EIF cannot accept a different model.
 
 FROM python:3.12-bookworm AS base
 
@@ -21,32 +21,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install llama-cpp-python (CPU build; openblas optional but skip for simplicity)
-RUN pip install --no-cache-dir llama-cpp-python==0.3.6
+# Granite Guardian 4.1 ships with the 'granite-docling' pre-tokenizer,
+# which only landed in llama.cpp / llama-cpp-python in 0.3.20+. Pin to
+# the latest stable so both Granite 4.1 and Qwen3Guard load.
+RUN pip install --no-cache-dir llama-cpp-python==0.3.21
 
-# Stage the in-enclave server code
 COPY src/ /app/src/
 
-# Model: pulled at build time. v1 default = Granite Guardian 4.1 8B
-# (Q4_K_M ~5GB). The IBM HuggingFace repo is gated; pass HF_TOKEN at
-# build time. Override MODEL_URL to use any other GGUF guardrail
-# (e.g. QuantFactory/Llama-Guard-3-8B-GGUF for a public alternative).
-ARG HF_TOKEN
-ARG MODEL_URL=https://huggingface.co/ibm-granite/granite-guardian-3.3-8b-GGUF/resolve/main/granite-guardian-3.3-8b-Q4_K_M.gguf
-RUN mkdir -p /opt/models && \
-    if [ -n "$HF_TOKEN" ]; then \
-      curl -L -H "Authorization: Bearer $HF_TOKEN" -o /opt/models/guardrail.gguf "$MODEL_URL"; \
-    else \
-      curl -L -o /opt/models/guardrail.gguf "$MODEL_URL"; \
-    fi && \
-    ls -lh /opt/models/ && \
-    [ "$(stat -c%s /opt/models/guardrail.gguf)" -gt 1000000 ] || (echo "Model download failed (file too small — likely auth error)" >&2 && exit 1)
+# Expected SHA-256 of each GGUF the parent will stream. Defaults
+# point at mradermacher's public Q4_K_M mirrors; override at build
+# time with --build-arg if you mirror the weights elsewhere.
+#
+# Compute with: sha256sum granite-guardian-4.1-8b.Q4_K_M.gguf
+ARG GRANITE_SHA256=""
+ARG QWEN_SHA256=""
 
-ENV PYTHONPATH=/app/src \
-    RG_MODEL_PATH=/opt/models/guardrail.gguf \
+ENV PYTHONPATH=/app/src:/usr/local/lib/python3.12/site-packages \
+    RG_LOAD_PORT=5006 \
     RG_VSOCK_PORT=5005 \
+    RG_MODEL_DIR=/tmp/models \
     RG_MODEL_CTX=4096 \
-    RG_MODEL_THREADS=32
+    RG_MODEL_THREADS=16 \
+    RG_GRANITE_SHA256=${GRANITE_SHA256} \
+    RG_QWEN_SHA256=${QWEN_SHA256}
 
-# Enclave entrypoint; vsock listener inside the enclave.
-CMD ["python3", "-m", "retroguard_classifier.server"]
+# Use absolute interpreter path so the enclave init's exec doesn't
+# accidentally pick a different python from PATH.
+CMD ["/usr/local/bin/python3", "-m", "retroguard_classifier.server"]
