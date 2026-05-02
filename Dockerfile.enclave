@@ -8,7 +8,7 @@
 # Model: ibm-granite/granite-guardian-4.1-8b-gguf (Q4_K_M ~5GB).
 # Inference: llama-cpp-python (CPU-only; matches AWS sample).
 
-FROM python:3.12-slim-bookworm AS base
+FROM python:3.12-bookworm AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -32,7 +32,7 @@ COPY src/ /app/src/
 # build time. Override MODEL_URL to use any other GGUF guardrail
 # (e.g. QuantFactory/Llama-Guard-3-8B-GGUF for a public alternative).
 ARG HF_TOKEN
-ARG MODEL_URL=https://huggingface.co/ibm-granite/granite-guardian-4.1-8b-gguf/resolve/main/granite-guardian-4.1-8b-Q4_K_M.gguf
+ARG MODEL_URL=https://huggingface.co/ibm-granite/granite-guardian-3.3-8b-GGUF/resolve/main/granite-guardian-3.3-8b-Q4_K_M.gguf
 RUN mkdir -p /opt/models && \
     if [ -n "$HF_TOKEN" ]; then \
       curl -L -H "Authorization: Bearer $HF_TOKEN" -o /opt/models/guardrail.gguf "$MODEL_URL"; \
