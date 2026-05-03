@@ -26,13 +26,16 @@ from __future__ import annotations
 import ctypes
 import fcntl
 import threading
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-import cbor2  # type: ignore[import-not-found]
-from cryptography.hazmat.primitives import serialization  # type: ignore[import-not-found]
-from cryptography.hazmat.primitives.asymmetric import rsa  # type: ignore[import-not-found]
-from cryptography.hazmat.primitives.asymmetric.padding import MGF1, OAEP  # type: ignore[import-not-found]
-from cryptography.hazmat.primitives.hashes import SHA256  # type: ignore[import-not-found]
+# `cbor2` and `cryptography` are only available inside the EIF (the
+# enclave's pip install). Importing them at module load would block test
+# collection on hosts that don't ship them. The Granite-template module
+# below depends on `server.py` which depends on this module — so keep
+# the imports lazy and pull them in only when the NSM ioctl actually
+# fires or the recipient keypair is touched.
+if TYPE_CHECKING:
+    from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: F401
 
 # struct nsm_msg { struct iovec request; struct iovec response; }
 # iovec on x86_64: { void* base; size_t length; }   → 16 bytes each → 32 total
@@ -70,6 +73,8 @@ def get_attestation_document(
     resistant). `public_key` is meaningful when the customer wants to
     encrypt a payload to the enclave; we don't use it here.
     """
+    import cbor2  # type: ignore[import-not-found]
+
     request = {
         "Attestation": {
             "user_data": user_data,
@@ -98,7 +103,7 @@ def get_attestation_document(
         fcntl.ioctl(fd.fileno(), _NSM_IOCTL_MSG, msg)
 
     response_bytes = bytes(response_buf[: msg.response.length])
-    response = cbor2.loads(response_bytes)
+    response = cbor2.loads(response_bytes)  # noqa: F821 — imported above
     if "Attestation" not in response or "document" not in response["Attestation"]:
         raise RuntimeError(f"unexpected NSM response: {response!r}")
     return bytes(response["Attestation"]["document"])
@@ -114,11 +119,14 @@ def get_attestation_document(
 # specific running enclave can unwrap. Rotated implicitly on every reboot.
 
 _keypair_lock = threading.Lock()
-_private_key: Optional[rsa.RSAPrivateKey] = None
+_private_key: Optional["rsa.RSAPrivateKey"] = None
 _public_key_der: Optional[bytes] = None
 
 
-def _ensure_keypair() -> tuple[rsa.RSAPrivateKey, bytes]:
+def _ensure_keypair() -> tuple["rsa.RSAPrivateKey", bytes]:
+    from cryptography.hazmat.primitives import serialization  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.asymmetric import rsa  # type: ignore[import-not-found]
+
     global _private_key, _public_key_der
     with _keypair_lock:
         if _private_key is None:
@@ -162,7 +170,16 @@ def unwrap_kms_recipient_ciphertext(ciphertext_for_recipient: bytes) -> bytes:
     deps.
     """
     from asn1crypto.cms import ContentInfo  # type: ignore[import-not-found]
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.asymmetric.padding import (  # type: ignore[import-not-found]
+        MGF1,
+        OAEP,
+    )
+    from cryptography.hazmat.primitives.ciphers import (  # type: ignore[import-not-found]
+        Cipher,
+        algorithms,
+        modes,
+    )
+    from cryptography.hazmat.primitives.hashes import SHA256  # type: ignore[import-not-found]
     from cryptography.hazmat.primitives.padding import PKCS7  # type: ignore[import-not-found]
 
     priv, _ = _ensure_keypair()

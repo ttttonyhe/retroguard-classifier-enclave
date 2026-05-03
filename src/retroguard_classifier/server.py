@@ -22,8 +22,10 @@ Wire protocol:
     Connection closes after both verified. If verification fails the
     enclave logs and exits.
   * Port 5005 (classify): newline-delimited JSON.
-        Request:  {"op":"classify","request_id":"...","text":"...","direction":"input|output"}
-        Response: {"request_id":"...","verdict":"safe|unsafe","label":"...","latency_ms":...}
+        Request:  {"op":"classify","request_id":"...","text":"...",
+                   "direction":"input|output","categories":["harm",...]}
+        Response: {"request_id":"...","verdict":"safe|unsafe","label":"<cat>"|null,
+                   "per_category":{"<cat>":"yes|no",...},"latency_ms":...}
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import time
@@ -60,36 +63,138 @@ MODEL_CTX = int(os.environ.get("RG_MODEL_CTX", "4096"))
 MODEL_THREADS = int(os.environ.get("RG_MODEL_THREADS", "32"))
 
 
-def _build_safety_prompt(text: str, direction: str) -> str:
-    """Single-token Yes/No verdict prompt for the safety classifier.
+# --------------------------------------------------------------------------
+# Official Granite Guardian 4.1 prompt template per IBM model card.
+# https://huggingface.co/ibm-granite/granite-guardian-4.1-8b
+#
+# We use no-think mode (faster — emits empty <think> tags then the
+# verdict) for the warm-path serving loop. Output is always:
+#     <think>\n</think>\n<score>yes|no</score>
+# Parsed with `_parse_score` below. The `</think>` we kept seeing as a
+# "label" in earlier attempts wasn't a model bug — it was the close-tag
+# of the structured envelope we never knew to expect.
+# --------------------------------------------------------------------------
 
-    Trimming to ~25 tokens of prompt overhead drops warm-path latency
-    by ~4x vs the original multi-category template. The classifier is
-    used for both input + output checks; direction just changes which
-    side of the conversation we describe.
+GUARDIAN_INSTRUCTION_NOTHINK = (
+    "<no-think>As a judge agent, assess whether the provided text meets the given "
+    "judging criteria using all available information, including conversations, "
+    "documents, and tools. Provide your score immediately without explanation. "
+    "Output empty <think>\\n</think> tags followed by your score in <score></score> tags."
+)
+
+# Pre-baked criterion text — verbatim phrasings that map onto IBM's
+# six trained safety categories. Granite was trained on each criterion
+# independently; per-category classification gives the strongest signal.
+CRITERION_TEXT: dict[str, str] = {
+    "harm": (
+        "Harm: Universally harmful content across all contexts."
+    ),
+    "social_bias": (
+        "Social Bias: Systemic prejudice against groups; stereotypes and "
+        "discriminatory attitudes."
+    ),
+    "jailbreaking": (
+        "Jailbreaking: Deliberate evasion of an AI system's built-in safeguards "
+        "or ethical boundaries; manipulation into providing restricted content."
+    ),
+    "violence": (
+        "Violence: Physical harm depictions, assault, self-harm, threats, "
+        "or intimidation."
+    ),
+    "profanity": (
+        "Profanity: Offensive or socially unacceptable language; curse words, "
+        "swear words (excludes slurs)."
+    ),
+    "unethical_behavior": (
+        "Unethical Behavior: Fraud, theft, abuse of power; moral or "
+        "professional violations (excludes physical violence)."
+    ),
+}
+
+
+def _build_guardian_block(criterion_text: str, scoring_target: str) -> str:
+    """Assemble the IBM-spec'd <guardian> message body.
+
+    `scoring_target` lets us swap the schema language between user-text
+    checks (input direction) and assistant-text checks (output direction)
+    while keeping the structured shape Granite was trained on.
     """
-    speaker = "user" if direction == "input" else "assistant"
     return (
-        "<|start_of_role|>system<|end_of_role|>"
-        f"Reply 'Yes' if the {speaker} message is harmful, 'No' otherwise."
-        "<|end_of_text|>\n"
-        f"<|start_of_role|>{speaker}<|end_of_role|>{text}<|end_of_text|>\n"
+        f"<guardian>{GUARDIAN_INSTRUCTION_NOTHINK}\n\n"
+        f"### Criteria: {criterion_text}\n\n"
+        f"### Scoring Schema: If {scoring_target} meets the criteria, "
+        "return 'yes'; otherwise, return 'no'."
+    )
+
+
+def _build_granite_judge_prompt(text: str, direction: str, criterion_text: str) -> str:
+    """Build the official Granite chat-template-formatted prompt.
+
+    For input checks we score the user message directly; for output
+    checks we present the user/assistant turn pair so the judge has
+    full conversation context (Granite was trained that way per the
+    "last assistant's text" schema).
+    """
+    if direction == "input":
+        guardian = _build_guardian_block(criterion_text, "the user's message")
+        return (
+            f"<|start_of_role|>user<|end_of_role|>{text}<|end_of_text|>\n"
+            f"<|start_of_role|>user<|end_of_role|>{guardian}<|end_of_text|>\n"
+            "<|start_of_role|>assistant<|end_of_role|>"
+        )
+    # output: the prior user turn isn't visible to the classifier, so
+    # we synthesize a placeholder that doesn't bias the judgement.
+    guardian = _build_guardian_block(criterion_text, "the last assistant's text")
+    return (
+        "<|start_of_role|>user<|end_of_role|>(prior user turn)<|end_of_text|>\n"
+        f"<|start_of_role|>assistant<|end_of_role|>{text}<|end_of_text|>\n"
+        f"<|start_of_role|>user<|end_of_role|>{guardian}<|end_of_text|>\n"
         "<|start_of_role|>assistant<|end_of_role|>"
     )
 
 
-class GuardrailEngine:
-    """Wraps a single GGUF model loaded via llama-cpp-python."""
+# `</score>` is in the stop-token set so llama-cpp halts generation as
+# soon as Granite tries to close the tag (saves ~10 tokens of latency).
+# That means the raw text we see ends with `<score> yes` or `<score> no`
+# — the closing tag was eaten by the stop matcher. Match either form.
+_SCORE_RE = re.compile(
+    r"<score>\s*(yes|no)\b",
+    re.IGNORECASE,
+)
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
-    def __init__(
-        self,
-        name: str,
-        model_path: Path,
-        prompt_builder,
-        stop_tokens: list[str],
-        max_tokens: int,
-        default_label: str,
-    ) -> None:
+
+def _parse_score(raw: str) -> str | None:
+    """Pull the verdict out of `<think>...</think><score>yes|no(</score>)?`.
+
+    Returns "yes", "no", or None when the model drifted off-template.
+    """
+    cleaned = _THINK_RE.sub("", raw or "", count=1).strip()
+    m = _SCORE_RE.search(cleaned)
+    if not m:
+        return None
+    return m.group(1).lower()
+
+
+class GuardrailEngine:
+    """Wraps the Granite Guardian 4.1 GGUF loaded via llama-cpp-python.
+
+    Each `classify` call evaluates the text against ONE criterion. The
+    DualClassifier wraps this with per-category dispatch — a 3-category
+    policy (jailbreaking + violence + harm) costs 3 forward passes;
+    Granite was trained per-criterion, so this is the IBM-recommended
+    accuracy/latency tradeoff.
+    """
+
+    # Stop on `</score>` so we close out as soon as the verdict lands.
+    # No-think mode emits roughly:
+    #   `<think>\n</think>\n<score>yes`  (close tag consumed by stop)
+    # which is ~10 tokens — `MAX_TOKENS=16` gives a small safety margin
+    # without paying for runaway generation.
+    STOP_TOKENS = ["</score>", "<|end_of_text|>", "</s>"]
+    MAX_TOKENS = 16
+
+    def __init__(self, name: str, model_path: Path) -> None:
         log.info("loading %s from %s (ctx=%d, threads=%d)", name, model_path, MODEL_CTX, MODEL_THREADS)
         from llama_cpp import Llama  # type: ignore[import-not-found]
 
@@ -101,55 +206,138 @@ class GuardrailEngine:
             n_batch=512,
             verbose=False,
         )
-        self._prompt_builder = prompt_builder
-        self._stop_tokens = stop_tokens
-        self._max_tokens = max_tokens
-        self._default_label = default_label
         log.info("loaded %s", name)
 
-    def classify(self, text: str, direction: str) -> dict[str, Any]:
-        prompt = self._prompt_builder(text, direction)
+    def classify_one(self, *, text: str, direction: str, criterion_text: str) -> dict[str, Any]:
+        """Evaluate `text` against a single criterion. Returns a yes/no score."""
+        prompt = _build_granite_judge_prompt(text, direction, criterion_text)
         out = self._llm(
             prompt,
-            max_tokens=self._max_tokens,
+            max_tokens=self.MAX_TOKENS,
             temperature=0.0,
-            stop=self._stop_tokens,
+            stop=self.STOP_TOKENS,
         )
         raw = (out.get("choices", [{}])[0].get("text") or "").strip()
-        first_line = raw.splitlines()[0].strip().lower() if raw else ""
-        unsafe = first_line.startswith("yes") or first_line.startswith("unsafe")
-        verdict = "unsafe" if unsafe else "safe"
-        label: str | None = None
-        if verdict == "unsafe":
-            if len(raw.splitlines()) > 1:
-                label = raw.splitlines()[1].split(",")[0].strip().lower() or None
-            label = label or self._default_label
-        return {"verdict": verdict, "label": label, "engine": self._name, "raw": raw[:200]}
+        score = _parse_score(raw)
+        # Failure-to-parse is treated as `no` (safe) per the model card's
+        # binary contract — Granite's verdict tag was missing or garbled,
+        # which historically meant the request didn't even score (e.g.
+        # truncated mid-`<think>`). Logged so we can audit accuracy.
+        if score is None:
+            log.warning(
+                "granite verdict unparseable; treating as 'no' (safe). raw=%r", raw[:200]
+            )
+        return {"score": score or "no", "raw": raw[:200]}
+
+
+def _build_combined_criterion(categories: list[str]) -> str:
+    """One BYOC criterion that ORs together every enabled category.
+
+    Granite was trained per-category, but the model card explicitly
+    supports custom natural-language criteria. Combining lets us answer
+    the policy question ("is this text in violation of any enabled
+    category?") in a single forward pass — ~3-5x faster than checking
+    each category sequentially. The trade-off: when blocked, we know
+    *something* in the policy fired but can't pin which one without
+    a second pass.
+    """
+    bullets = []
+    for cat in categories:
+        text = CRITERION_TEXT.get(cat)
+        if text:
+            bullets.append(f"  - {text}")
+    body = "\n".join(bullets)
+    return (
+        "The text violates the safety policy if any of the following criteria apply:\n"
+        f"{body}"
+    )
 
 
 class DualClassifier:
-    """Single-engine classifier serving both input + output checks.
+    """Granite-Guardian dispatcher with two latency profiles.
 
-    Historically routed input → Granite, output → Qwen3Guard-Gen.
-    Qwen3Guard-Gen was dropped (no token-by-token streaming support
-    under llama-cpp; the streaming-capable variant needs a different
-    inference runtime). Both directions now go through Granite, which
-    parallelizes well enough that the streaming handler (`handle_stream`)
-    can run output checks asynchronously off the token-forwarding hot
-    path. The class name is preserved for compatibility with callers.
+    `combined=True` (default, fast):
+        ONE forward pass with a BYOC criterion that ORs together every
+        enabled category. ~4s on c7i CPU regardless of category count.
+        On unsafe verdict, label = first enabled category (we lose the
+        per-category attribution but gain ~3x latency).
+
+    `combined=False` (per-category, more attribution):
+        Sequential pass per category, short-circuiting on first match.
+        ~4s × N categories worst case. Useful for telemetry / shadow
+        evaluation runs where attribution matters.
+
+    Wire contract: `(text, direction, categories, combined?)` — the
+    parent passes the policy's `enabled_categories` plus an optional
+    `combined` flag. Empty `categories` skips classification entirely.
+
+    Returns:
+        {
+          "verdict": "safe" | "unsafe",
+          "label": <category> | None,
+          "per_category": {<cat>: "yes"|"no"|"skipped"},
+          "mode": "combined" | "per_category",
+        }
     """
 
     def __init__(self) -> None:
-        self.engine = GuardrailEngine(
-            "safety-classifier", GRANITE_PATH, _build_safety_prompt,
-            stop_tokens=["<|end_of_text|>", "</s>"],
-            max_tokens=4,
-            default_label="harm",
-        )
-        log.info("safety classifier loaded (single-engine mode)")
+        self.engine = GuardrailEngine("safety-classifier", GRANITE_PATH)
+        log.info("safety classifier loaded (single-engine)")
 
-    def classify(self, text: str, direction: str) -> dict[str, Any]:
-        return self.engine.classify(text, direction)
+    def classify(
+        self,
+        *,
+        text: str,
+        direction: str,
+        categories: list[str],
+        combined: bool = True,
+    ) -> dict[str, Any]:
+        valid = [c for c in categories if c in CRITERION_TEXT]
+        unknown = [c for c in categories if c not in CRITERION_TEXT]
+        for c in unknown:
+            log.warning("unknown criterion category: %r — skipping", c)
+
+        if not valid:
+            return {"verdict": "safe", "label": None, "per_category": {}, "mode": "noop"}
+
+        if combined:
+            criterion = _build_combined_criterion(valid)
+            r = self.engine.classify_one(
+                text=text, direction=direction, criterion_text=criterion
+            )
+            unsafe = r["score"] == "yes"
+            return {
+                "verdict": "unsafe" if unsafe else "safe",
+                # We can't attribute which category fired on a combined
+                # check. Surface the first one as the label so the
+                # customer-visible code is at least in their policy.
+                "label": valid[0] if unsafe else None,
+                "per_category": {cat: ("?" if unsafe else "no") for cat in valid},
+                "mode": "combined",
+            }
+
+        # Per-category, short-circuit on first match.
+        per_category: dict[str, str] = {}
+        first_match: str | None = None
+        for cat in valid:
+            criterion = CRITERION_TEXT[cat]
+            r = self.engine.classify_one(
+                text=text, direction=direction, criterion_text=criterion
+            )
+            per_category[cat] = r["score"]
+            if r["score"] == "yes" and first_match is None:
+                first_match = cat
+                break
+        # Mark un-evaluated categories as "skipped" rather than "no"
+        # so audit logs don't read like we cleared everything.
+        for cat in valid:
+            per_category.setdefault(cat, "skipped")
+        return {
+            "verdict": "unsafe" if first_match else "safe",
+            "label": first_match,
+            "per_category": per_category,
+            "mode": "per_category",
+        }
 
 
 # Linux 4.14 (the kernel baked into nitro-cli's bzImage) has a virtio_vsock
@@ -664,15 +852,39 @@ def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
                 continue
 
             t0 = time.monotonic()
+            categories = msg.get("categories")
+            if not isinstance(categories, list) or not categories:
+                # No categories enabled → nothing to evaluate. Skip the
+                # forward pass entirely so observation deployments don't
+                # pay Granite latency for verdicts they wouldn't act on.
+                conn.sendall(
+                    (
+                        json.dumps(
+                            {
+                                "request_id": msg.get("request_id"),
+                                "verdict": "safe",
+                                "label": None,
+                                "per_category": {},
+                                "latency_ms": 0.0,
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                continue
             result = classifier.classify(
                 text=msg.get("text", ""),
                 direction=msg.get("direction", "input"),
+                categories=[str(c) for c in categories],
+                combined=bool(msg.get("combined", True)),
             )
             latency_ms = round((time.monotonic() - t0) * 1000, 2)
             payload = {
                 "request_id": msg.get("request_id"),
                 "verdict": result["verdict"],
                 "label": result["label"],
+                "per_category": result["per_category"],
+                "mode": result.get("mode"),
                 "latency_ms": latency_ms,
             }
             conn.sendall((json.dumps(payload) + "\n").encode())
