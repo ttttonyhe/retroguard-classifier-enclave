@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream Granite + Qwen3Guard GGUFs into a freshly-booted enclave.
+"""Stream the configured GGUF set into a freshly-booted enclave.
 
 Two modes:
 
@@ -8,8 +8,9 @@ Two modes:
   the EIF. Suitable for public weights (Granite Guardian / Qwen3Guard).
 
   KMS-attested (`--mode kms`) — for sealed weights:
-    1. We send `{"mode":"kms"}` and receive an attestation document
-       (which embeds the enclave's fresh recipient pubkey).
+    1. We send `{"mode":"kms","models":[{"label":"granite"}, ...]}` and
+       receive an attestation document (which embeds the enclave's
+       fresh recipient pubkey).
     2. We hand the doc + the KMS-wrapped data key to KMS Decrypt with
        `Recipient.AttestationDocument`. KMS returns the data key
        re-encrypted to the enclave's pubkey.
@@ -19,16 +20,37 @@ Two modes:
 
 Wire format on RG_LOAD_PORT (default 5006):
 
-    SEND: {"mode":"plaintext"}\\n
-      then for each model: [8-byte BE length][bytes]
+    SEND: {"mode":"plaintext","models":[{"label":"granite"}, ...]}\\n
+      then for each label (in order): [8-byte BE length][bytes]
 
-    SEND: {"mode":"kms","nonce_b64":"..."}\\n
+    SEND: {"mode":"kms","models":[...],"nonce_b64":"..."}\\n
       RECV: {"attestation_doc_b64":"..."}\\n
       SEND: {"ciphertext_for_recipient_b64":"..."}\\n
-      then for each model: [8-byte BE framed-len][12B IV][ciphertext][16B tag]
+      then for each label (in order): [8-byte BE framed-len][12B IV][ciphertext][16B tag]
 
 In both modes the enclave finishes with `{"status":"loaded"}\\n` and
 opens RG_VSOCK_PORT (default 5005) for classify traffic.
+
+Usage (KMS):
+    python3 load_models.py --mode kms \\
+        --kms-key-id alias/retroguard-models \\
+        --encrypted-data-key /opt/models/encrypted/data-key.kms \\
+        --model granite=/opt/models/encrypted/granite.gcm \\
+        --model qwen_06b=/opt/models/encrypted/qwen_06b.gcm \\
+        --model qwen_4b=/opt/models/encrypted/qwen_4b.gcm \\
+        --model qwen_8b=/opt/models/encrypted/qwen_8b.gcm
+
+Usage (plaintext):
+    python3 load_models.py --mode plaintext \\
+        --model granite=/opt/models/granite.gguf \\
+        --model qwen_06b=/opt/models/qwen3guard-gen-0.6b.gguf \\
+        ...
+
+Hash printing helper (for setting --build-arg <LABEL>_SHA256 on the EIF):
+    python3 load_models.py --print-hashes \\
+        --model granite=/opt/models/granite.gguf \\
+        --model qwen_06b=/opt/models/qwen3guard-gen-0.6b.gguf \\
+        ...
 """
 
 from __future__ import annotations
@@ -83,11 +105,7 @@ def _send_blob(sock: socket.socket, path: Path, label: str) -> None:
 
 
 def _send_encrypted_blob(sock: socket.socket, path: Path, label: str) -> None:
-    """Send a [12B IV][ciphertext][16B tag] blob produced by encrypt_models.py.
-
-    The framed length on the wire is the file size (IV + ct + tag), so
-    the enclave can pre-read IV/tag at known offsets.
-    """
+    """Send a [12B IV][ciphertext][16B tag] blob produced by encrypt_models.py."""
     size = path.stat().st_size
     if size < 12 + 16:
         raise SystemExit(f"{label}: encrypted file too short ({size} bytes)")
@@ -125,11 +143,15 @@ def _kms_handshake(
     encrypted_data_key: bytes,
     region: str,
     nonce: bytes | None,
+    labels: list[str],
 ) -> None:
-    """Send {"mode":"kms"}, get attestation, call KMS, send back ciphertext_for_recipient."""
+    """Send {"mode":"kms",...}, get attestation, call KMS, send back ciphertext_for_recipient."""
     import boto3  # type: ignore[import-not-found]
 
-    header = {"mode": "kms"}
+    header: dict[str, object] = {
+        "mode": "kms",
+        "models": [{"label": label} for label in labels],
+    }
     if nonce:
         header["nonce_b64"] = base64.b64encode(nonce).decode()
     sock.sendall((json.dumps(header) + "\n").encode())
@@ -159,54 +181,75 @@ def _kms_handshake(
     sock.sendall((json.dumps({"ciphertext_for_recipient_b64": base64.b64encode(cfr).decode()}) + "\n").encode())
 
 
+def _parse_model_arg(value: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(f"--model expects label=path, got {value!r}")
+    label, _, path_str = value.partition("=")
+    label = label.strip()
+    path = Path(path_str.strip()).expanduser()
+    if not label:
+        raise argparse.ArgumentTypeError(f"--model {value!r}: empty label")
+    return label, path
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--cid", type=int, default=16)
     p.add_argument("--port", type=int, default=5006)
     p.add_argument("--mode", choices=["plaintext", "kms"], default="plaintext")
-    p.add_argument("--granite", type=Path, required=False)
+    p.add_argument(
+        "--model", action="append", type=_parse_model_arg, metavar="LABEL=PATH",
+        help="Repeatable: label=path of the GGUF (plaintext) or GCM blob (kms) to send.",
+    )
     # KMS-mode only:
     p.add_argument("--kms-key-id", help="ARN/ID of the KMS CMK that wraps the data key")
     p.add_argument("--encrypted-data-key", type=Path, help="File containing the KMS-wrapped data key")
-    p.add_argument("--encrypted-granite", type=Path, help="AES-GCM ciphertext of granite GGUF (IV||ct||tag)")
     p.add_argument("--region", default=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
     p.add_argument("--nonce-hex", help="Optional nonce to bind into the attestation doc")
     p.add_argument("--print-hashes", action="store_true",
-                   help="Compute and print SHA-256 of the plaintext model "
-                        "(for setting --build-arg GRANITE_SHA256 on the EIF).")
+                   help="Compute and print SHA-256 of each plaintext model "
+                        "(for setting --build-arg <LABEL>_SHA256 on the EIF).")
     args = p.parse_args()
 
-    if args.print_hashes:
-        if not args.granite:
-            print("--print-hashes needs --granite", file=sys.stderr)
-            return 2
-        print(f"GRANITE_SHA256={_sha256(args.granite)}")
-        return 0
+    if not args.model:
+        print("at least one --model label=path is required", file=sys.stderr)
+        return 2
 
-    if args.mode == "plaintext":
-        if not args.granite:
-            print("plaintext mode needs --granite", file=sys.stderr)
-            return 2
-        if not args.granite.exists():
-            print(f"missing: {args.granite}", file=sys.stderr)
-            return 2
-    else:
-        for required in ("kms_key_id", "encrypted_data_key", "encrypted_granite"):
-            if not getattr(args, required):
-                print(f"kms mode needs --{required.replace('_', '-')}", file=sys.stderr)
-                return 2
-        for path in (args.encrypted_data_key, args.encrypted_granite):
+    if args.print_hashes:
+        for label, path in args.model:
             if not path.exists():
                 print(f"missing: {path}", file=sys.stderr)
                 return 2
+            print(f"RG_{label.upper()}_SHA256={_sha256(path)}")
+        return 0
+
+    for _, path in args.model:
+        if not path.exists():
+            print(f"missing: {path}", file=sys.stderr)
+            return 2
+
+    if args.mode == "kms":
+        for required in ("kms_key_id", "encrypted_data_key"):
+            if not getattr(args, required):
+                print(f"kms mode needs --{required.replace('_', '-')}", file=sys.stderr)
+                return 2
+        if not args.encrypted_data_key.exists():
+            print(f"missing: {args.encrypted_data_key}", file=sys.stderr)
+            return 2
 
     print(f"connecting to enclave cid={args.cid} port={args.port}", flush=True)
     s = socket.socket(AF_VSOCK, socket.SOCK_STREAM)
     s.connect((args.cid, args.port))
     try:
+        labels = [label for label, _ in args.model]
         if args.mode == "plaintext":
-            s.sendall(b'{"mode":"plaintext"}\n')
-            _send_blob(s, args.granite, "granite")
+            header = {
+                "mode": "plaintext",
+                "models": [{"label": label} for label in labels],
+            }
+            s.sendall((json.dumps(header) + "\n").encode())
+            for label, path in args.model:
+                _send_blob(s, path, label)
         else:
             nonce = bytes.fromhex(args.nonce_hex) if args.nonce_hex else None
             edk = args.encrypted_data_key.read_bytes()
@@ -216,8 +259,10 @@ def main() -> int:
                 encrypted_data_key=edk,
                 region=args.region,
                 nonce=nonce,
+                labels=labels,
             )
-            _send_encrypted_blob(s, args.encrypted_granite, "granite")
+            for label, path in args.model:
+                _send_encrypted_blob(s, path, label)
 
         ack = _recv_line(s)
         print(f"enclave ack: {ack!r}", flush=True)

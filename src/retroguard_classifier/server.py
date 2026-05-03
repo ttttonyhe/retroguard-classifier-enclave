@@ -1,31 +1,34 @@
 """In-enclave classifier server.
 
-Runs inside the Nitro Enclave. The 8B Q4_K_M dual-model bundle is
-~10GB — too large to bake into the EIF cpio (nitro-cli 1.4.4 caps
-useful initramfs around ~5GB). Instead, the parent streams the
-GGUF blobs over vsock at boot and the enclave verifies each blob's
-SHA-256 against constants baked into the image (and therefore
-measured by PCR0).
+Runs inside the Nitro Enclave. Hosts FOUR GGUFs that the parent
+streams over vsock at boot:
 
-Trust model:
-  * The parent CAN read the model bytes (Granite Guardian / Qwen3Guard
-    are public). What it cannot do is substitute a different file: the
-    enclave refuses any blob whose digest does not match the baked
-    constants, and any tampering with those constants changes PCR0.
-  * Customers attest the EIF (PCRs), then verify the constants are the
-    expected mradermacher Q4_K_M digests against the transparency log.
+    granite      — granite-guardian-4.1-8b   (i1-Q4_K_S, ~4.7 GB)
+                   Used ONLY when the request carries custom NL
+                   criteria — Granite was trained on a custom-criteria
+                   schema that other guard models can't replicate.
+    qwen_06b     — Qwen3Guard-Gen-0.6B       (Q4_K_M,    ~0.4 GB)  → tier `fast`
+    qwen_4b      — Qwen3Guard-Gen-4B         (Q4_K_M,    ~2.5 GB)  → tier `expert`
+    qwen_8b      — Qwen3Guard-Gen-8B         (Q4_K_M,    ~5.1 GB)  → tier `heavy`
+
+Each blob's SHA-256 is baked into the EIF (and therefore PCR0).
+The parent CAN read the bytes (all four checkpoints are public),
+but cannot substitute a different file: the enclave refuses any
+blob whose digest doesn't match the baked constant.
 
 Wire protocol:
-  * Port 5006 (load): one connection. Two framed blobs back-to-back.
-        [8-byte BE length][bytes]   ← Granite GGUF
-        [8-byte BE length][bytes]   ← Qwen3Guard GGUF
-    Connection closes after both verified. If verification fails the
-    enclave logs and exits.
+  * Port 5006 (load): one connection. Header JSON declares which
+    `models` are coming (in order); for each, an [8-byte BE length]
+    [bytes] frame follows. KMS mode adds an attestation handshake
+    before the framed blobs (see `_negotiate_kms_data_key`).
   * Port 5005 (classify): newline-delimited JSON.
         Request:  {"op":"classify","request_id":"...","text":"...",
-                   "direction":"input|output","categories":["harm",...]}
+                   "direction":"input|output","categories":["harm",...],
+                   "protection_effort":"fast|expert|heavy",
+                   "custom_criteria":[{"id":"...","text":"..."}]}
         Response: {"request_id":"...","verdict":"safe|unsafe","label":"<cat>"|null,
-                   "per_category":{"<cat>":"yes|no",...},"latency_ms":...}
+                   "per_category":{"<cat>":"yes|no",...},"engine":"granite|qwen_xx",
+                   "latency_ms":...}
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ import re
 import socket
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -57,22 +61,54 @@ log = logging.getLogger("enclave")
 LOAD_PORT = int(os.environ.get("RG_LOAD_PORT", "5006"))
 CLASSIFY_PORT = int(os.environ.get("RG_VSOCK_PORT", "5005"))
 MODEL_DIR = Path(os.environ.get("RG_MODEL_DIR", "/tmp/models"))
-GRANITE_PATH = MODEL_DIR / "granite-guardian.gguf"
-GRANITE_SHA256 = os.environ.get("RG_GRANITE_SHA256", "").lower()
 MODEL_CTX = int(os.environ.get("RG_MODEL_CTX", "4096"))
 MODEL_THREADS = int(os.environ.get("RG_MODEL_THREADS", "32"))
 
 
 # --------------------------------------------------------------------------
-# Official Granite Guardian 4.1 prompt template per IBM model card.
-# https://huggingface.co/ibm-granite/granite-guardian-4.1-8b
-#
-# We use no-think mode (faster — emits empty <think> tags then the
-# verdict) for the warm-path serving loop. Output is always:
-#     <think>\n</think>\n<score>yes|no</score>
-# Parsed with `_parse_score` below. The `</think>` we kept seeing as a
-# "label" in earlier attempts wasn't a model bug — it was the close-tag
-# of the structured envelope we never knew to expect.
+# Model registry — each tier maps to a labelled GGUF on disk + a baked
+# SHA-256 (env-injected at EIF build time, therefore measured by PCR0).
+# `protection_effort` request field selects qwen_06b / qwen_4b / qwen_8b;
+# any request with non-empty `custom_criteria` is forced onto granite
+# regardless of the requested tier.
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ModelSpec:
+    label: str
+    filename: str
+    sha256: str  # lowercase hex; "" disables the model (load will refuse)
+
+
+def _spec(label: str, filename: str, env_var: str) -> ModelSpec:
+    return ModelSpec(
+        label=label,
+        filename=filename,
+        sha256=os.environ.get(env_var, "").strip().lower(),
+    )
+
+
+MODEL_SPECS: dict[str, ModelSpec] = {
+    "granite":  _spec("granite",  "granite-guardian.gguf", "RG_GRANITE_SHA256"),
+    "qwen_06b": _spec("qwen_06b", "qwen3guard-gen-0.6b.gguf", "RG_QWEN_06B_SHA256"),
+    "qwen_4b":  _spec("qwen_4b",  "qwen3guard-gen-4b.gguf",  "RG_QWEN_4B_SHA256"),
+    "qwen_8b":  _spec("qwen_8b",  "qwen3guard-gen-8b.gguf",  "RG_QWEN_8B_SHA256"),
+}
+
+# Backwards-compat: kept so existing callers / tests can still reference the
+# Granite path directly. `MODEL_SPECS["granite"]` is the source of truth.
+GRANITE_PATH = MODEL_DIR / MODEL_SPECS["granite"].filename
+
+
+def _model_path(label: str) -> Path:
+    return MODEL_DIR / MODEL_SPECS[label].filename
+
+
+# --------------------------------------------------------------------------
+# Granite Guardian 4.1 prompt template (per IBM model card, no-think mode).
+# Used only when the request carries custom NL criteria — Granite was
+# trained on the `<guardian>... ### Criteria: ... ### Scoring Schema: ...`
+# schema and gives the strongest signal on free-form rules.
 # --------------------------------------------------------------------------
 
 GUARDIAN_INSTRUCTION_NOTHINK = (
@@ -83,8 +119,7 @@ GUARDIAN_INSTRUCTION_NOTHINK = (
 )
 
 # Pre-baked criterion text — verbatim phrasings that map onto IBM's
-# six trained safety categories. Granite was trained on each criterion
-# independently; per-category classification gives the strongest signal.
+# six trained safety categories.
 CRITERION_TEXT: dict[str, str] = {
     "harm": (
         "Harm: Universally harmful content across all contexts."
@@ -113,12 +148,7 @@ CRITERION_TEXT: dict[str, str] = {
 
 
 def _build_guardian_block(criterion_text: str, scoring_target: str) -> str:
-    """Assemble the IBM-spec'd <guardian> message body.
-
-    `scoring_target` lets us swap the schema language between user-text
-    checks (input direction) and assistant-text checks (output direction)
-    while keeping the structured shape Granite was trained on.
-    """
+    """Assemble the IBM-spec'd <guardian> message body."""
     return (
         f"<guardian>{GUARDIAN_INSTRUCTION_NOTHINK}\n\n"
         f"### Criteria: {criterion_text}\n\n"
@@ -128,13 +158,7 @@ def _build_guardian_block(criterion_text: str, scoring_target: str) -> str:
 
 
 def _build_granite_judge_prompt(text: str, direction: str, criterion_text: str) -> str:
-    """Build the official Granite chat-template-formatted prompt.
-
-    For input checks we score the user message directly; for output
-    checks we present the user/assistant turn pair so the judge has
-    full conversation context (Granite was trained that way per the
-    "last assistant's text" schema).
-    """
+    """Build the official Granite chat-template-formatted prompt."""
     if direction == "input":
         guardian = _build_guardian_block(criterion_text, "the user's message")
         return (
@@ -142,8 +166,6 @@ def _build_granite_judge_prompt(text: str, direction: str, criterion_text: str) 
             f"<|start_of_role|>user<|end_of_role|>{guardian}<|end_of_text|>\n"
             "<|start_of_role|>assistant<|end_of_role|>"
         )
-    # output: the prior user turn isn't visible to the classifier, so
-    # we synthesize a placeholder that doesn't bias the judgement.
     guardian = _build_guardian_block(criterion_text, "the last assistant's text")
     return (
         "<|start_of_role|>user<|end_of_role|>(prior user turn)<|end_of_text|>\n"
@@ -153,22 +175,12 @@ def _build_granite_judge_prompt(text: str, direction: str, criterion_text: str) 
     )
 
 
-# `</score>` is in the stop-token set so llama-cpp halts generation as
-# soon as Granite tries to close the tag (saves ~10 tokens of latency).
-# That means the raw text we see ends with `<score> yes` or `<score> no`
-# — the closing tag was eaten by the stop matcher. Match either form.
-_SCORE_RE = re.compile(
-    r"<score>\s*(yes|no)\b",
-    re.IGNORECASE,
-)
+_SCORE_RE = re.compile(r"<score>\s*(yes|no)\b", re.IGNORECASE)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 def _parse_score(raw: str) -> str | None:
-    """Pull the verdict out of `<think>...</think><score>yes|no(</score>)?`.
-
-    Returns "yes", "no", or None when the model drifted off-template.
-    """
+    """Pull the verdict out of `<think>...</think><score>yes|no(</score>)?`."""
     cleaned = _THINK_RE.sub("", raw or "", count=1).strip()
     m = _SCORE_RE.search(cleaned)
     if not m:
@@ -176,29 +188,123 @@ def _parse_score(raw: str) -> str | None:
     return m.group(1).lower()
 
 
-class GuardrailEngine:
-    """Wraps the Granite Guardian 4.1 GGUF loaded via llama-cpp-python.
+# --------------------------------------------------------------------------
+# Qwen3Guard-Gen prompt template + parser (per HF model card).
+#
+# Qwen3Guard-Gen is a generative safety classifier fine-tuned to emit:
+#     Safety: Safe|Unsafe|Controversial
+#     Categories: <comma-separated list>
+#     Refusal: Yes|No                 # response moderation only
+#
+# It uses the standard Qwen3 chat template with NO explicit safety
+# system prompt — the moderation behavior is baked into the weights.
+# We feed it the raw user/assistant turns; for output moderation we
+# synthesize a placeholder user turn since the actual prior turn
+# isn't always visible to the classifier at this layer.
+# --------------------------------------------------------------------------
 
-    Each `classify` call evaluates the text against ONE criterion. The
-    DualClassifier wraps this with per-category dispatch — a 3-category
-    policy (jailbreaking + violence + harm) costs 3 forward passes;
-    Granite was trained per-criterion, so this is the IBM-recommended
-    accuracy/latency tradeoff.
+# Qwen3Guard taxonomy (from the model card). Same set for input + output
+# with `Jailbreak` only emitted on input checks.
+QWEN_CATEGORIES_INPUT = (
+    "Violent",
+    "Non-violent Illegal Acts",
+    "Sexual Content or Sexual Acts",
+    "PII",
+    "Suicide & Self-Harm",
+    "Unethical Acts",
+    "Politically Sensitive Topics",
+    "Copyright Violation",
+    "Jailbreak",
+)
+QWEN_CATEGORIES_OUTPUT = QWEN_CATEGORIES_INPUT[:-1]  # drop Jailbreak
+
+# Map from policy categories (the customer-facing taxonomy that the
+# dashboard exposes) to the Qwen taxonomy. A policy category fires
+# iff Qwen's emitted Categories list intersects this set.
+#
+# `profanity` has no native Qwen3Guard category — customers needing
+# strict profanity moderation should use heavy + custom criteria
+# (Granite path). Surfaced at policy-edit time, not at runtime.
+POLICY_TO_QWEN: dict[str, frozenset[str]] = {
+    "harm": frozenset({
+        "Violent", "Suicide & Self-Harm", "Non-violent Illegal Acts",
+    }),
+    "violence": frozenset({"Violent"}),
+    "jailbreaking": frozenset({"Jailbreak"}),
+    "social_bias": frozenset({"Unethical Acts"}),
+    "profanity": frozenset(),
+    "unethical_behavior": frozenset({
+        "Unethical Acts", "Non-violent Illegal Acts",
+    }),
+}
+
+
+def _build_qwen_judge_prompt(
+    text: str, direction: str, prior_user_text: str = "(prior user turn)"
+) -> str:
+    """Standard Qwen3 chat template; no system prompt."""
+    if direction == "input":
+        return (
+            f"<|im_start|>user\n{text}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+    # Response moderation: present the user/assistant pair, then prime
+    # the moderation output with another assistant turn.
+    return (
+        f"<|im_start|>user\n{prior_user_text}<|im_end|>\n"
+        f"<|im_start|>assistant\n{text}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+
+_QWEN_SAFETY_RE = re.compile(
+    r"Safety\s*:\s*(Safe|Unsafe|Controversial)\b", re.IGNORECASE
+)
+_QWEN_CATEGORIES_RE = re.compile(
+    r"Categor(?:y|ies)\s*:\s*([^\n\r]+)", re.IGNORECASE
+)
+
+
+def _parse_qwen_output(raw: str) -> dict[str, Any]:
+    """Extract {safety, categories[]} from Qwen3Guard-Gen output.
+
+    Lenient: accepts `Category:` or `Categories:` and strips brackets
+    / quotes / "None" sentinels. Returns None for safety when the model
+    drifted off-template (treated as safe by the dispatcher).
+    """
+    text = raw or ""
+    safety_m = _QWEN_SAFETY_RE.search(text)
+    cats_m = _QWEN_CATEGORIES_RE.search(text)
+    safety = safety_m.group(1).lower() if safety_m else None
+    raw_cats = cats_m.group(1) if cats_m else ""
+    # Strip wrapping `[...]`, quotes, and per-item whitespace.
+    raw_cats = raw_cats.strip().strip("[]")
+    parts = [c.strip().strip("'\"") for c in raw_cats.split(",")]
+    cats = [c for c in parts if c and c.lower() != "none"]
+    return {"safety": safety, "categories": cats}
+
+
+# --------------------------------------------------------------------------
+# Engines: each wraps one GGUF loaded via llama-cpp-python.
+# --------------------------------------------------------------------------
+
+class _LlamaEngineBase:
+    """Loads a GGUF and exposes a single completion call.
+
+    Shared base so Granite + Qwen engines share the loader and don't
+    re-implement llama-cpp boilerplate.
     """
 
-    # Stop on `</score>` so we close out as soon as the verdict lands.
-    # No-think mode emits roughly:
-    #   `<think>\n</think>\n<score>yes`  (close tag consumed by stop)
-    # which is ~10 tokens — `MAX_TOKENS=16` gives a small safety margin
-    # without paying for runaway generation.
-    STOP_TOKENS = ["</score>", "<|end_of_text|>", "</s>"]
-    MAX_TOKENS = 16
-
-    def __init__(self, name: str, model_path: Path) -> None:
-        log.info("loading %s from %s (ctx=%d, threads=%d)", name, model_path, MODEL_CTX, MODEL_THREADS)
+    def __init__(self, *, name: str, model_path: Path, max_tokens: int, stop: list[str]) -> None:
+        log.info(
+            "loading %s from %s (ctx=%d, threads=%d)",
+            name, model_path, MODEL_CTX, MODEL_THREADS,
+        )
         from llama_cpp import Llama  # type: ignore[import-not-found]
 
-        self._name = name
+        self.name = name
+        self._max_tokens = max_tokens
+        self._stop = stop
         self._llm = Llama(
             model_path=str(model_path),
             n_ctx=MODEL_CTX,
@@ -208,21 +314,39 @@ class GuardrailEngine:
         )
         log.info("loaded %s", name)
 
-    def classify_one(self, *, text: str, direction: str, criterion_text: str) -> dict[str, Any]:
-        """Evaluate `text` against a single criterion. Returns a yes/no score."""
-        prompt = _build_granite_judge_prompt(text, direction, criterion_text)
+    def _generate(self, prompt: str) -> str:
         out = self._llm(
             prompt,
-            max_tokens=self.MAX_TOKENS,
+            max_tokens=self._max_tokens,
             temperature=0.0,
+            stop=self._stop,
+        )
+        return (out.get("choices", [{}])[0].get("text") or "").strip()
+
+
+class GraniteGuardEngine(_LlamaEngineBase):
+    """Granite Guardian 4.1 — per-criterion yes/no judge.
+
+    `</score>` in the stop set so generation halts as soon as the verdict
+    lands (~10 tokens). MAX_TOKENS=16 gives a safety margin without
+    paying for runaway generation.
+    """
+
+    STOP_TOKENS = ["</score>", "<|end_of_text|>", "</s>"]
+    MAX_TOKENS = 16
+
+    def __init__(self, model_path: Path) -> None:
+        super().__init__(
+            name="granite",
+            model_path=model_path,
+            max_tokens=self.MAX_TOKENS,
             stop=self.STOP_TOKENS,
         )
-        raw = (out.get("choices", [{}])[0].get("text") or "").strip()
+
+    def classify_one(self, *, text: str, direction: str, criterion_text: str) -> dict[str, Any]:
+        prompt = _build_granite_judge_prompt(text, direction, criterion_text)
+        raw = self._generate(prompt)
         score = _parse_score(raw)
-        # Failure-to-parse is treated as `no` (safe) per the model card's
-        # binary contract — Granite's verdict tag was missing or garbled,
-        # which historically meant the request didn't even score (e.g.
-        # truncated mid-`<think>`). Logged so we can audit accuracy.
         if score is None:
             log.warning(
                 "granite verdict unparseable; treating as 'no' (safe). raw=%r", raw[:200]
@@ -230,22 +354,58 @@ class GuardrailEngine:
         return {"score": score or "no", "raw": raw[:200]}
 
 
-def _build_combined_criterion(categories: list[str]) -> str:
-    """One BYOC criterion that ORs together every enabled category.
+class QwenGuardEngine(_LlamaEngineBase):
+    """Qwen3Guard-Gen — single-pass safety classifier.
 
-    Granite was trained per-category, but the model card explicitly
-    supports custom natural-language criteria. Combining lets us answer
-    the policy question ("is this text in violation of any enabled
-    category?") in a single forward pass — ~3-5x faster than checking
-    each category sequentially. The trade-off: when blocked, we know
-    *something* in the policy fired but can't pin which one without
-    a second pass.
+    Output ≈ "Safety: Unsafe\\nCategories: Violent, Jailbreak\\nRefusal: No"
+    — well under 64 tokens. `<|im_end|>` is the natural stop.
+    """
+
+    STOP_TOKENS = ["<|im_end|>", "<|endoftext|>"]
+    MAX_TOKENS = 64
+
+    def __init__(self, *, name: str, model_path: Path) -> None:
+        super().__init__(
+            name=name,
+            model_path=model_path,
+            max_tokens=self.MAX_TOKENS,
+            stop=self.STOP_TOKENS,
+        )
+
+    def classify_native(self, *, text: str, direction: str) -> dict[str, Any]:
+        prompt = _build_qwen_judge_prompt(text, direction)
+        raw = self._generate(prompt)
+        parsed = _parse_qwen_output(raw)
+        return {**parsed, "raw": raw[:300]}
+
+
+# --------------------------------------------------------------------------
+# Combined-criterion helper — Granite-only. Built-in categories + customer
+# NL criteria collapse into one prompt; one forward pass per request.
+# --------------------------------------------------------------------------
+
+def _build_custom_combined_criterion(
+    builtin_categories: list[str],
+    custom_criteria: list[dict[str, str]],
+) -> str:
+    """Combine built-in categories AND customer-supplied NL criteria.
+
+    Granite's strength: each criterion is plain English; OR-ing them in
+    one prompt costs a single forward pass. Per-criterion attribution is
+    lost (we report `custom-1` or the first enabled category as the
+    label on a hit), but customers chose `heavy` for accuracy not
+    attribution-granularity.
     """
     bullets = []
-    for cat in categories:
-        text = CRITERION_TEXT.get(cat)
-        if text:
-            bullets.append(f"  - {text}")
+    for cat in builtin_categories:
+        t = CRITERION_TEXT.get(cat)
+        if t:
+            bullets.append(f"  - {t}")
+    for c in custom_criteria:
+        cid = (c.get("id") or "custom").strip()
+        ctext = (c.get("text") or "").strip()
+        if ctext:
+            bullets.append(f"  - {cid}: {ctext}")
     body = "\n".join(bullets)
     return (
         "The text violates the safety policy if any of the following criteria apply:\n"
@@ -253,36 +413,50 @@ def _build_combined_criterion(categories: list[str]) -> str:
     )
 
 
-class DualClassifier:
-    """Granite-Guardian dispatcher with two latency profiles.
+# --------------------------------------------------------------------------
+# TieredClassifier — dispatches by (protection_effort, custom_criteria).
+# --------------------------------------------------------------------------
 
-    `combined=True` (default, fast):
-        ONE forward pass with a BYOC criterion that ORs together every
-        enabled category. ~4s on c7i CPU regardless of category count.
-        On unsafe verdict, label = first enabled category (we lose the
-        per-category attribution but gain ~3x latency).
+class TieredClassifier:
+    """Routes each `op:classify` to the right engine.
 
-    `combined=False` (per-category, more attribution):
-        Sequential pass per category, short-circuiting on first match.
-        ~4s × N categories worst case. Useful for telemetry / shadow
-        evaluation runs where attribution matters.
+    Dispatch matrix:
+        custom_criteria non-empty → Granite (regardless of tier; we
+                                    auto-promote to heavy at the parent
+                                    too — this is the safety net)
+        tier=fast,   no custom    → Qwen 0.6B
+        tier=expert, no custom    → Qwen 4B
+        tier=heavy,  no custom    → Qwen 8B
 
-    Wire contract: `(text, direction, categories, combined?)` — the
-    parent passes the policy's `enabled_categories` plus an optional
-    `combined` flag. Empty `categories` skips classification entirely.
+    Customer-facing categories (`harm`, `violence`, `jailbreaking`, ...)
+    are mapped onto each engine's native taxonomy — Granite uses the
+    IBM-trained criterion text; Qwen uses POLICY_TO_QWEN.
 
-    Returns:
-        {
-          "verdict": "safe" | "unsafe",
-          "label": <category> | None,
-          "per_category": {<cat>: "yes"|"no"|"skipped"},
-          "mode": "combined" | "per_category",
-        }
+    Eager-load on construction. Memory budget at c7i.12xlarge / 80 GiB
+    enclave is comfortable: ~14 GiB working set for all four engines.
     """
 
-    def __init__(self) -> None:
-        self.engine = GuardrailEngine("safety-classifier", GRANITE_PATH)
-        log.info("safety classifier loaded (single-engine)")
+    def __init__(
+        self,
+        *,
+        granite: GraniteGuardEngine,
+        qwen_06b: QwenGuardEngine,
+        qwen_4b: QwenGuardEngine,
+        qwen_8b: QwenGuardEngine,
+    ) -> None:
+        self.granite = granite
+        self.qwen_06b = qwen_06b
+        self.qwen_4b = qwen_4b
+        self.qwen_8b = qwen_8b
+        log.info("tiered classifier ready (4 engines loaded)")
+
+    def _select_qwen(self, tier: str) -> QwenGuardEngine:
+        if tier == "fast":
+            return self.qwen_06b
+        if tier == "heavy":
+            return self.qwen_8b
+        # `expert` is the default and the safe fallback for unknown tiers.
+        return self.qwen_4b
 
     def classify(
         self,
@@ -290,53 +464,126 @@ class DualClassifier:
         text: str,
         direction: str,
         categories: list[str],
-        combined: bool = True,
+        protection_effort: str = "expert",
+        custom_criteria: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
-        valid = [c for c in categories if c in CRITERION_TEXT]
+        custom = [c for c in (custom_criteria or []) if (c.get("text") or "").strip()]
+        valid_builtin = [c for c in categories if c in CRITERION_TEXT]
         unknown = [c for c in categories if c not in CRITERION_TEXT]
         for c in unknown:
             log.warning("unknown criterion category: %r — skipping", c)
 
-        if not valid:
-            return {"verdict": "safe", "label": None, "per_category": {}, "mode": "noop"}
-
-        if combined:
-            criterion = _build_combined_criterion(valid)
-            r = self.engine.classify_one(
-                text=text, direction=direction, criterion_text=criterion
-            )
-            unsafe = r["score"] == "yes"
+        if not valid_builtin and not custom:
             return {
-                "verdict": "unsafe" if unsafe else "safe",
-                # We can't attribute which category fired on a combined
-                # check. Surface the first one as the label so the
-                # customer-visible code is at least in their policy.
-                "label": valid[0] if unsafe else None,
-                "per_category": {cat: ("?" if unsafe else "no") for cat in valid},
-                "mode": "combined",
+                "verdict": "safe", "label": None, "per_category": {},
+                "engine": "noop", "mode": "noop",
             }
 
-        # Per-category, short-circuit on first match.
-        per_category: dict[str, str] = {}
-        first_match: str | None = None
-        for cat in valid:
-            criterion = CRITERION_TEXT[cat]
-            r = self.engine.classify_one(
-                text=text, direction=direction, criterion_text=criterion
+        # Custom criteria → always Granite (the only engine trained on
+        # arbitrary natural-language rules). Customer's tier choice is
+        # respected at the parent's policy gate; here we just route.
+        if custom:
+            return self._classify_granite_custom(
+                text=text,
+                direction=direction,
+                builtin_categories=valid_builtin,
+                custom_criteria=custom,
             )
-            per_category[cat] = r["score"]
-            if r["score"] == "yes" and first_match is None:
-                first_match = cat
-                break
-        # Mark un-evaluated categories as "skipped" rather than "no"
-        # so audit logs don't read like we cleared everything.
-        for cat in valid:
-            per_category.setdefault(cat, "skipped")
+
+        return self._classify_qwen(
+            engine=self._select_qwen(protection_effort),
+            text=text,
+            direction=direction,
+            categories=valid_builtin,
+        )
+
+    # --- Granite path (custom criteria) -----------------------------------
+
+    def _classify_granite_custom(
+        self,
+        *,
+        text: str,
+        direction: str,
+        builtin_categories: list[str],
+        custom_criteria: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        criterion = _build_custom_combined_criterion(
+            builtin_categories, custom_criteria
+        )
+        r = self.granite.classify_one(
+            text=text, direction=direction, criterion_text=criterion
+        )
+        unsafe = r["score"] == "yes"
+        # Attribution preference on a hit: first custom criterion wins,
+        # else the first enabled built-in. Either way it's a category
+        # the customer's policy actually references.
+        if unsafe:
+            label = (custom_criteria[0].get("id") or "custom") if custom_criteria else (
+                builtin_categories[0] if builtin_categories else None
+            )
+        else:
+            label = None
+        per_category: dict[str, str] = {
+            cat: ("?" if unsafe else "no") for cat in builtin_categories
+        }
+        for c in custom_criteria:
+            cid = c.get("id") or "custom"
+            per_category[cid] = "?" if unsafe else "no"
         return {
-            "verdict": "unsafe" if first_match else "safe",
-            "label": first_match,
+            "verdict": "unsafe" if unsafe else "safe",
+            "label": label,
             "per_category": per_category,
-            "mode": "per_category",
+            "engine": "granite",
+            "mode": "combined_custom",
+        }
+
+    # --- Qwen path (built-in only) ----------------------------------------
+
+    def _classify_qwen(
+        self,
+        *,
+        engine: QwenGuardEngine,
+        text: str,
+        direction: str,
+        categories: list[str],
+    ) -> dict[str, Any]:
+        parsed = engine.classify_native(text=text, direction=direction)
+        safety = parsed.get("safety")
+        fired_qwen_cats = set(parsed.get("categories") or [])
+
+        # Treat `Controversial` as `Unsafe` for blocking decisions —
+        # customers are free to override the default policy.
+        if safety not in ("unsafe", "controversial"):
+            return {
+                "verdict": "safe",
+                "label": None,
+                "per_category": {c: "no" for c in categories},
+                "engine": engine.name,
+                "mode": "qwen",
+            }
+
+        matched_label: str | None = None
+        per_category: dict[str, str] = {}
+        for cat in categories:
+            mapped = POLICY_TO_QWEN.get(cat, frozenset())
+            if mapped & fired_qwen_cats:
+                per_category[cat] = "yes"
+                if matched_label is None:
+                    matched_label = cat
+            else:
+                per_category[cat] = "no"
+
+        # Qwen flagged unsafe but the customer didn't enable any matching
+        # category → don't block. The parent surfaces this in audit logs
+        # but treats the request as safe per the explicit policy.
+        return {
+            "verdict": "unsafe" if matched_label else "safe",
+            "label": matched_label,
+            "per_category": per_category,
+            "engine": engine.name,
+            "mode": "qwen",
+            "qwen_safety": safety,
+            "qwen_categories": list(fired_qwen_cats),
         }
 
 
@@ -362,12 +609,7 @@ def _recv_exact(conn: socket.socket, n: int) -> bytes:
 
 
 def _stream_blob(conn: socket.socket, dest: Path, expected_sha256: str, label: str) -> None:
-    """Receive [8-byte BE length][bytes] from `conn`, write to `dest`, verify SHA-256.
-
-    Streams to disk in RECV_CHUNK-sized blocks (see comment on the constant
-    for the vsock kernel-bug rationale). Raises on hash mismatch — caller
-    exits the enclave so a tampered upload cannot reach the classifier.
-    """
+    """Receive [8-byte BE length][bytes] from `conn`, write to `dest`, verify SHA-256."""
     n = int.from_bytes(_recv_exact(conn, 8), "big")
     log.info("receiving %s: %d bytes", label, n)
     h = hashlib.sha256()
@@ -402,13 +644,7 @@ def _stream_blob(conn: socket.socket, dest: Path, expected_sha256: str, label: s
 def _stream_encrypted_blob(
     conn: socket.socket, dest: Path, data_key: bytes, expected_sha256: str, label: str
 ) -> None:
-    """Receive [8-byte BE length][12-byte IV][ciphertext][16-byte tag], decrypt to `dest`.
-
-    AES-256-GCM with the provided data_key. We stream-decrypt directly
-    to disk + a hashing context — never materializing the full 5 GiB
-    plaintext in memory. The GCM tag is verified at the end via
-    `finalize_with_tag`; if it fails, the partial file is removed.
-    """
+    """Receive [8-byte BE length][12-byte IV][ciphertext][16-byte tag], decrypt to `dest`."""
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # type: ignore[import-not-found]
 
     framed_len = int.from_bytes(_recv_exact(conn, 8), "big")
@@ -452,8 +688,6 @@ def _stream_encrypted_blob(
                 fout.write(tail)
                 h.update(tail)
         except Exception:
-            # Partial plaintext on disk could be mistaken for a valid
-            # model on a subsequent boot — wipe it on any failure.
             fout.close()
             try:
                 dest.unlink()
@@ -475,24 +709,38 @@ def _stream_encrypted_blob(
         )
 
 
+def _resolve_models_to_load(header: dict[str, Any]) -> list[str]:
+    """Pick which models to expect from the parent's load handshake.
+
+    Header may pass `"models": ["granite", "qwen_06b", ...]` to choose a
+    subset; absent / empty → every spec with a baked SHA-256. Unknown
+    labels are rejected so a malicious manifest can't sneak in a path
+    we don't expect.
+    """
+    requested = header.get("models")
+    if isinstance(requested, list) and requested:
+        labels: list[str] = []
+        for entry in requested:
+            label = entry["label"] if isinstance(entry, dict) else str(entry)
+            if label not in MODEL_SPECS:
+                raise RuntimeError(f"unknown model label in manifest: {label!r}")
+            labels.append(label)
+        return labels
+    # Default: load everything for which we have a SHA baked in. This
+    # lets the parent run "send all models" without needing to enumerate.
+    return [label for label, spec in MODEL_SPECS.items() if spec.sha256]
+
+
 def _load_models_from_parent() -> None:
-    """Phase 1: accept ONE upload connection on LOAD_PORT, stream both models.
+    """Phase 1: accept ONE upload connection on LOAD_PORT, stream all configured models.
 
-    Two modes selected by the parent's first newline-delimited JSON message:
+    Header JSON (parent → enclave):
+        {"mode":"plaintext", "models":[{"label":"granite"}, ...]}
+        {"mode":"kms",       "models":[...], "nonce_b64":"..."}
 
-      * `{"mode":"plaintext"}` (default) — stream cleartext GGUFs; we hash
-        each on the way in and compare against PCR-baked constants.
-      * `{"mode":"kms"}` — KMS-attested decrypt path:
-          1. We reply with `{"attestation_doc_b64":...}` (the doc embeds
-             our per-enclave RSA pubkey).
-          2. Parent calls `kms.Decrypt(Recipient=...)` and sends back
-             `{"ciphertext_for_recipient_b64":...}`.
-          3. We RSA-OAEP-SHA256 unwrap to a 32-byte AES-256 data key.
-          4. Parent then streams [iv][ciphertext][tag]-framed blobs and
-             we AES-GCM-decrypt + SHA-verify the plaintexts.
-
-    Blocks until both files are written and verified. Subsequent
-    uploads are ignored (the load port is closed after success).
+    For each label in `models` (in order): one [8-byte len][bytes] frame
+    in plaintext mode, or one [8-byte framed_len][IV][ct][tag] frame in
+    kms mode. The data key is negotiated once and reused for all blobs.
     """
     AF_VSOCK = getattr(socket, "AF_VSOCK", 40)
     VMADDR_CID_ANY = getattr(socket, "VMADDR_CID_ANY", 0xFFFFFFFF)
@@ -506,12 +754,6 @@ def _load_models_from_parent() -> None:
     conn, addr = sock.accept()
     log.info("upload connection from cid=%s port=%s", addr[0], addr[1])
     try:
-        # IMPORTANT: read the JSON header byte-by-byte. _read_line() buffers
-        # in 4 KiB chunks and silently drops anything past the newline — that
-        # would eat the 8-byte length prefix (and the start of the GGUF) and
-        # the next read would interpret model bytes as a length, hanging on
-        # an exabyte-sized recv. The header is small (< 200 B), so the
-        # per-byte recv cost is irrelevant.
         header_line = _read_line_byte(conn)
         if not header_line:
             raise ConnectionError("parent closed before sending mode header")
@@ -521,13 +763,23 @@ def _load_models_from_parent() -> None:
             raise RuntimeError(f"bad mode header: {exc}: {header_line!r}") from exc
 
         mode = header.get("mode", "plaintext")
-        if mode == "plaintext":
-            _stream_blob(conn, GRANITE_PATH, GRANITE_SHA256, "granite")
-        elif mode == "kms":
+        labels = _resolve_models_to_load(header)
+        log.info("load manifest: mode=%s labels=%s", mode, labels)
+
+        data_key: bytes | None = None
+        if mode == "kms":
             data_key = _negotiate_kms_data_key(conn, header)
-            _stream_encrypted_blob(conn, GRANITE_PATH, data_key, GRANITE_SHA256, "granite")
-        else:
+        elif mode != "plaintext":
             raise RuntimeError(f"unknown load mode: {mode!r}")
+
+        for label in labels:
+            spec = MODEL_SPECS[label]
+            dest = MODEL_DIR / spec.filename
+            if mode == "kms":
+                assert data_key is not None
+                _stream_encrypted_blob(conn, dest, data_key, spec.sha256, label)
+            else:
+                _stream_blob(conn, dest, spec.sha256, label)
 
         conn.sendall(b'{"status":"loaded"}\n')
     finally:
@@ -542,15 +794,7 @@ def _load_models_from_parent() -> None:
 
 
 def _negotiate_kms_data_key(conn: socket.socket, header: dict[str, Any]) -> bytes:
-    """KMS handshake on the load connection.
-
-    1. Generate an attestation document binding the enclave's recipient
-       public key + the parent-supplied nonce (if any).
-    2. Send `{"attestation_doc_b64":...}` so the parent can pass it as
-       `Recipient.AttestationDocument` to `kms.Decrypt`.
-    3. Read `{"ciphertext_for_recipient_b64":...}` and unwrap the
-       returned 32-byte data key with the matching private key.
-    """
+    """KMS handshake on the load connection (see module docstring)."""
     nonce = _decode_b64(header.get("nonce_b64"))
     pubkey_der = nsm.get_recipient_public_key_der()  # type: ignore[attr-defined]
     log.info("kms handshake: pubkey_der=%d bytes nonce=%s",
@@ -577,7 +821,6 @@ def _negotiate_kms_data_key(conn: socket.socket, header: dict[str, Any]) -> byte
 
 
 def _decode_b64(value: str | None) -> bytes | None:
-    """Tolerantly decode an optional base64 field from a vsock message."""
     if not value:
         return None
     return base64.b64decode(value)
@@ -588,9 +831,7 @@ def _read_line(conn: socket.socket) -> str | None:
 
     NB: this WILL over-read past the newline (chunks of up to 4 KiB), so
     only safe on a request/reply protocol where the rest of the buffer
-    can be discarded. For the `_load_models_from_parent` handshake (where
-    a length-prefixed binary blob follows the JSON header on the same
-    connection) use _read_line_byte() instead.
+    can be discarded.
     """
     chunks: list[bytes] = []
     while True:
@@ -606,12 +847,7 @@ def _read_line(conn: socket.socket) -> str | None:
 
 
 def _read_line_byte(conn: socket.socket) -> str | None:
-    """Read a newline-delimited message one byte at a time.
-
-    Slow but correct: leaves any subsequent bytes on the socket so a
-    follow-up _recv_exact() / recv_into() reads them as expected. Use
-    this whenever the next message on the wire is a binary blob.
-    """
+    """Read a newline-delimited message one byte at a time."""
     out = bytearray()
     while True:
         b = conn.recv(1)
@@ -648,20 +884,6 @@ def _send_frame(conn: socket.socket, payload: dict[str, Any]) -> None:
 def _handle_chat(conn: socket.socket, msg: dict[str, Any]) -> None:
     log.info("op:chat received request_id=%s provider=%s stream=%s",
              msg.get("request_id"), msg.get("provider"), msg.get("stream"))
-    """Proxy a chat completion through to the upstream provider.
-
-    Wire (parent → enclave):
-        {"op":"chat","request_id":...,"recipient_ciphertext_b64":...,
-         "provider":"openai|anthropic","body":{...},"stream":bool}
-
-    Wire (enclave → parent), one or more newline-delimited frames:
-        Buffered: {"event":"buffered","status":int,"body":{...}}
-        Streaming: {"event":"start","status":int}
-                   {"event":"chunk","sse_line":"data: ..."}
-                   ... (repeated)
-                   {"event":"done"}
-        Errors:   {"event":"error","message":str,"upstream_status":int|None}
-    """
     request_id = msg.get("request_id", "")
     provider = msg.get("provider", "")
     body = msg.get("body") or {}
@@ -676,8 +898,6 @@ def _handle_chat(conn: socket.socket, msg: dict[str, Any]) -> None:
         _send_frame(conn, {"event": "error", "request_id": request_id, "message": "missing recipient_ciphertext_b64"})
         return
 
-    # 1. Recover the customer's plaintext API key. Lives in this stack frame
-    # only; we don't log it, don't forward it back to the parent.
     try:
         recipient_ct = base64.b64decode(recipient_ct_b64)
         log.info("op:chat unwrapping recipient_ct len=%d", len(recipient_ct))
@@ -688,7 +908,6 @@ def _handle_chat(conn: socket.socket, msg: dict[str, Any]) -> None:
         _send_frame(conn, {"event": "error", "request_id": request_id, "message": f"recipient_unwrap_failed: {exc}"})
         return
 
-    # 2. Open a TLS-over-vsock socket to the upstream via the parent's vsock-proxy.
     upstream_host = routing["host"]
     vsock_port = DEFAULT_UPSTREAM_PORTS.get(upstream_host)
     if vsock_port is None:
@@ -704,8 +923,6 @@ def _handle_chat(conn: socket.socket, msg: dict[str, Any]) -> None:
         return
 
     try:
-        # 3. Build + send the upstream request. Force `stream` to match what
-        # the parent asked for so the response framing is consistent.
         request_body = {**body, "stream": is_stream}
         body_bytes = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
         headers: dict[str, str] = {
@@ -724,10 +941,8 @@ def _handle_chat(conn: socket.socket, msg: dict[str, Any]) -> None:
             body=body_bytes,
         )
 
-        # Burn the api_key local; it's been written to the TLS socket already.
         api_key = ""
 
-        # 4. Parse response head.
         reader = HttpReader(tls)
         try:
             log.info("op:chat reading response status")
@@ -739,7 +954,6 @@ def _handle_chat(conn: socket.socket, msg: dict[str, Any]) -> None:
             _send_frame(conn, {"event": "error", "request_id": request_id, "message": f"upstream_head_read_failed: {exc}"})
             return
 
-        # 5. Stream or buffer body back through vsock.
         is_chunked = response_headers.get("transfer-encoding", "").lower() == "chunked"
         content_length_str = response_headers.get("content-length")
 
@@ -749,8 +963,6 @@ def _handle_chat(conn: socket.socket, msg: dict[str, Any]) -> None:
                 if is_chunked:
                     leftover = b""
                     for chunk in reader.iter_chunked():
-                        # An SSE chunk may contain one or more events; split on \n\n.
-                        # Buffer leftover bytes from the previous chunk to re-stitch.
                         leftover += chunk
                         while b"\n\n" in leftover:
                             event, _, leftover = leftover.partition(b"\n\n")
@@ -764,7 +976,6 @@ def _handle_chat(conn: socket.socket, msg: dict[str, Any]) -> None:
                             if line:
                                 _send_frame(conn, {"event": "chunk", "request_id": request_id, "sse_line": line})
                 else:
-                    # Some upstreams return non-chunked SSE — read until close, split.
                     raw = reader.read_until_close()
                     text = raw.decode("utf-8", errors="replace")
                     for line in text.splitlines():
@@ -801,7 +1012,7 @@ def _handle_chat(conn: socket.socket, msg: dict[str, Any]) -> None:
             pass
 
 
-def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
+def _serve_one(conn: socket.socket, classifier: TieredClassifier) -> None:
     try:
         while True:
             raw = _read_line(conn)
@@ -818,10 +1029,6 @@ def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
                 t0 = time.monotonic()
                 user_data = _decode_b64(msg.get("user_data_b64"))
                 nonce = _decode_b64(msg.get("nonce_b64"))
-                # When the parent is going to use this doc as a KMS Decrypt
-                # Recipient, it asks for the enclave's own RSA pubkey to be
-                # baked in — KMS will return ciphertext-for-recipient that
-                # only this running enclave's matching priv key can unwrap.
                 if msg.get("embed_recipient_pubkey"):
                     public_key = nsm.get_recipient_public_key_der()
                 else:
@@ -853,10 +1060,11 @@ def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
 
             t0 = time.monotonic()
             categories = msg.get("categories")
-            if not isinstance(categories, list) or not categories:
-                # No categories enabled → nothing to evaluate. Skip the
-                # forward pass entirely so observation deployments don't
-                # pay Granite latency for verdicts they wouldn't act on.
+            custom_criteria = msg.get("custom_criteria") or []
+            has_custom = any((c.get("text") or "").strip() for c in custom_criteria)
+
+            if (not isinstance(categories, list) or not categories) and not has_custom:
+                # No categories AND no custom criteria → nothing to evaluate.
                 conn.sendall(
                     (
                         json.dumps(
@@ -865,6 +1073,7 @@ def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
                                 "verdict": "safe",
                                 "label": None,
                                 "per_category": {},
+                                "engine": "noop",
                                 "latency_ms": 0.0,
                             }
                         )
@@ -872,11 +1081,15 @@ def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
                     ).encode()
                 )
                 continue
+
+            tier_raw = str(msg.get("protection_effort") or "expert").lower()
+            tier = tier_raw if tier_raw in ("fast", "expert", "heavy") else "expert"
             result = classifier.classify(
                 text=msg.get("text", ""),
                 direction=msg.get("direction", "input"),
-                categories=[str(c) for c in categories],
-                combined=bool(msg.get("combined", True)),
+                categories=[str(c) for c in (categories or [])],
+                protection_effort=tier,
+                custom_criteria=custom_criteria,
             )
             latency_ms = round((time.monotonic() - t0) * 1000, 2)
             payload = {
@@ -884,6 +1097,7 @@ def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
                 "verdict": result["verdict"],
                 "label": result["label"],
                 "per_category": result["per_category"],
+                "engine": result.get("engine"),
                 "mode": result.get("mode"),
                 "latency_ms": latency_ms,
             }
@@ -897,13 +1111,25 @@ def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
             pass
 
 
+def _build_tiered_classifier() -> TieredClassifier:
+    """Eager-load all four engines. Boot order: small to large so the
+    biggest mmap allocation happens last (less fragmentation pressure)."""
+    granite = GraniteGuardEngine(model_path=_model_path("granite"))
+    qwen_06b = QwenGuardEngine(name="qwen_06b", model_path=_model_path("qwen_06b"))
+    qwen_4b = QwenGuardEngine(name="qwen_4b", model_path=_model_path("qwen_4b"))
+    qwen_8b = QwenGuardEngine(name="qwen_8b", model_path=_model_path("qwen_8b"))
+    return TieredClassifier(
+        granite=granite, qwen_06b=qwen_06b, qwen_4b=qwen_4b, qwen_8b=qwen_8b,
+    )
+
+
 def main() -> int:
     import threading
 
     log.info("python=%s exe=%s", sys.version.split()[0], sys.executable)
     log.info("sys.path[:5]=%s", sys.path[:5])
     _load_models_from_parent()
-    classifier = DualClassifier()
+    classifier = _build_tiered_classifier()
 
     AF_VSOCK = getattr(socket, "AF_VSOCK", 40)
     VMADDR_CID_ANY = getattr(socket, "VMADDR_CID_ANY", 0xFFFFFFFF)
@@ -916,10 +1142,6 @@ def main() -> int:
     while True:
         conn, addr = sock.accept()
         log.info("accepted from cid=%s port=%s", addr[0], addr[1])
-        # Each parent-side client (NsmAttestationClient, VsockClassifier,
-        # VsockChatClient) keeps a long-lived vsock connection. Without
-        # threading, the first connection blocks the listener forever and
-        # no other client can talk to us. Daemon thread per connection.
         threading.Thread(
             target=_serve_one, args=(conn, classifier), daemon=True
         ).start()
