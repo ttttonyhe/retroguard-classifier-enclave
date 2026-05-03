@@ -34,38 +34,41 @@ from retroguard_classifier.server import (  # noqa: E402
 
 class TestGuardianBlock:
     def test_no_think_envelope_is_present(self) -> None:
-        block = _build_guardian_block("X criterion", "the user's message")
+        block = _build_guardian_block("X criterion")
         assert block.startswith("<guardian>")
         assert "<no-think>" in block
         assert "<score></score>" in block
 
     def test_criteria_section_present(self) -> None:
-        block = _build_guardian_block("X criterion", "the user's message")
+        block = _build_guardian_block("X criterion")
         assert "### Criteria: X criterion" in block
 
-    def test_scoring_schema_section_present(self) -> None:
-        block = _build_guardian_block("X criterion", "the user's message")
+    def test_scoring_schema_matches_ibm_template_verbatim(self) -> None:
+        """IBM's reference build_guardian_block hardcodes "the last
+        assistant's text" — same wording for every direction. Granite
+        was trained on this exact phrasing; customizing it per
+        direction drifts from the training distribution."""
+        block = _build_guardian_block("X criterion")
         assert "### Scoring Schema:" in block
-        assert "the user's message" in block
+        assert "the last assistant's text" in block
+        assert "the user's message" not in block
         assert "return 'yes'" in block and "return 'no'" in block
 
 
 class TestPrompt:
-    def test_input_direction_scores_user_message(self) -> None:
+    def test_input_direction_places_user_text_first(self) -> None:
         prompt = _build_granite_judge_prompt(
             text="hello world",
             direction="input",
             criterion_text="Harm: Universally harmful content.",
         )
-        # The user's text is the first user turn.
         assert "<|start_of_role|>user<|end_of_role|>hello world" in prompt
-        # Last turn primes the assistant for output.
+        # Last turn primes the assistant for the verdict.
         assert prompt.rstrip().endswith("<|start_of_role|>assistant<|end_of_role|>")
-        # The schema target language matches the direction.
-        assert "the user's message" in prompt
-        assert "the last assistant's text" not in prompt
+        # Schema target is hardcoded per IBM's spec, regardless of direction.
+        assert "the last assistant's text" in prompt
 
-    def test_output_direction_scores_assistant_text(self) -> None:
+    def test_output_direction_places_assistant_text_in_assistant_turn(self) -> None:
         prompt = _build_granite_judge_prompt(
             text="here is the answer",
             direction="output",
@@ -73,7 +76,6 @@ class TestPrompt:
         )
         assert "<|start_of_role|>assistant<|end_of_role|>here is the answer" in prompt
         assert "the last assistant's text" in prompt
-        assert "the user's message" not in prompt
 
     def test_prompt_includes_official_instruction(self) -> None:
         prompt = _build_granite_judge_prompt(

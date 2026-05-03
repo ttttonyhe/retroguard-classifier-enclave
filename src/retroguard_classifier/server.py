@@ -147,26 +147,39 @@ CRITERION_TEXT: dict[str, str] = {
 }
 
 
-def _build_guardian_block(criterion_text: str, scoring_target: str) -> str:
-    """Assemble the IBM-spec'd <guardian> message body."""
+def _build_guardian_block(criterion_text: str) -> str:
+    """Assemble the IBM-spec'd <guardian> message body.
+
+    Scoring schema text is hardcoded to 'the last assistant's text' to
+    match IBM's reference build_guardian_block from the model card —
+    that's the exact phrasing Granite was trained on, and it's used
+    even for input-direction (USER message) checks. We had earlier
+    customized the target per direction; that drifted from training and
+    measurably hurt accuracy on BYOC criteria.
+    """
     return (
         f"<guardian>{GUARDIAN_INSTRUCTION_NOTHINK}\n\n"
         f"### Criteria: {criterion_text}\n\n"
-        f"### Scoring Schema: If {scoring_target} meets the criteria, "
+        "### Scoring Schema: If the last assistant's text meets the criteria, "
         "return 'yes'; otherwise, return 'no'."
     )
 
 
 def _build_granite_judge_prompt(text: str, direction: str, criterion_text: str) -> str:
-    """Build the official Granite chat-template-formatted prompt."""
+    """Build the official Granite chat-template-formatted prompt.
+
+    Mirrors IBM's reference `apply_chat_template(..., add_generation_prompt=True)`
+    output for both input + output direction — the difference is only
+    where in the conversation the text-being-judged sits. The guardian
+    block is always the LAST user message regardless of direction.
+    """
+    guardian = _build_guardian_block(criterion_text)
     if direction == "input":
-        guardian = _build_guardian_block(criterion_text, "the user's message")
         return (
             f"<|start_of_role|>user<|end_of_role|>{text}<|end_of_text|>\n"
             f"<|start_of_role|>user<|end_of_role|>{guardian}<|end_of_text|>\n"
             "<|start_of_role|>assistant<|end_of_role|>"
         )
-    guardian = _build_guardian_block(criterion_text, "the last assistant's text")
     return (
         "<|start_of_role|>user<|end_of_role|>(prior user turn)<|end_of_text|>\n"
         f"<|start_of_role|>assistant<|end_of_role|>{text}<|end_of_text|>\n"
@@ -448,37 +461,23 @@ class QwenGuardEngine(_LlamaEngineBase):
 
 
 # --------------------------------------------------------------------------
-# Combined-criterion helper — Granite-only. Built-in categories + customer
-# NL criteria collapse into one prompt; one forward pass per request.
+# BYOC dispatch helpers. Per IBM's spec each criterion goes through its
+# own `apply_chat_template` call — combining N criteria into one bulleted
+# prompt drifts from the training distribution and degrades accuracy.
+# We OR per-criterion calls at the application layer instead.
 # --------------------------------------------------------------------------
 
-def _build_custom_combined_criterion(
-    builtin_categories: list[str],
+def _named_custom_criteria(
     custom_criteria: list[dict[str, str]],
-) -> str:
-    """Combine built-in categories AND customer-supplied NL criteria.
-
-    Granite's strength: each criterion is plain English; OR-ing them in
-    one prompt costs a single forward pass. Per-criterion attribution is
-    lost (we report `custom-1` or the first enabled category as the
-    label on a hit), but customers chose `heavy` for accuracy not
-    attribution-granularity.
-    """
-    bullets = []
-    for cat in builtin_categories:
-        t = CRITERION_TEXT.get(cat)
-        if t:
-            bullets.append(f"  - {t}")
+) -> list[tuple[str, str]]:
+    """Strip empties + canonicalize the (id, text) pairs."""
+    out: list[tuple[str, str]] = []
     for c in custom_criteria:
-        cid = (c.get("id") or "custom").strip()
-        ctext = (c.get("text") or "").strip()
-        if ctext:
-            bullets.append(f"  - {cid}: {ctext}")
-    body = "\n".join(bullets)
-    return (
-        "The text violates the safety policy if any of the following criteria apply:\n"
-        f"{body}"
-    )
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        out.append((c.get("id") or "custom", text))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -575,34 +574,62 @@ class TieredClassifier:
         builtin_categories: list[str],
         custom_criteria: list[dict[str, str]],
     ) -> dict[str, Any]:
-        criterion = _build_custom_combined_criterion(
-            builtin_categories, custom_criteria
-        )
-        r = self.granite.classify_one(
-            text=text, direction=direction, criterion_text=criterion
-        )
-        unsafe = r["score"] == "yes"
-        # Attribution preference on a hit: first custom criterion wins,
-        # else the first enabled built-in. Either way it's a category
-        # the customer's policy actually references.
-        if unsafe:
-            label = (custom_criteria[0].get("id") or "custom") if custom_criteria else (
-                builtin_categories[0] if builtin_categories else None
+        """Per-criterion Granite evaluation matching IBM's BYOC spec.
+
+        Each criterion (built-in category and customer custom rule) gets
+        its own forward pass with its own `apply_chat_template` prompt.
+        Short-circuit on the first 'yes' so worst-case latency is N
+        passes for an all-safe input but typical-block latency is one.
+
+        Per-criterion attribution is now real: the label = the exact
+        rule that fired. No more "?" placeholders in per_category.
+        """
+        named_custom = _named_custom_criteria(custom_criteria)
+        per_category: dict[str, str] = {}
+        matched_label: str | None = None
+
+        # Built-in categories first — short rule text, faster to refuse.
+        for cat in builtin_categories:
+            criterion = CRITERION_TEXT.get(cat)
+            if not criterion:
+                continue
+            r = self.granite.classify_one(
+                text=text, direction=direction, criterion_text=criterion
             )
-        else:
-            label = None
-        per_category: dict[str, str] = {
-            cat: ("?" if unsafe else "no") for cat in builtin_categories
-        }
-        for c in custom_criteria:
-            cid = c.get("id") or "custom"
-            per_category[cid] = "?" if unsafe else "no"
+            score = r["score"]
+            per_category[cat] = score
+            if score == "yes" and matched_label is None:
+                matched_label = cat
+                # Mark the rest as un-evaluated so audit logs reflect the
+                # short-circuit instead of falsely claiming "no".
+                for remaining in builtin_categories[
+                    builtin_categories.index(cat) + 1 :
+                ]:
+                    per_category.setdefault(remaining, "skipped")
+                for cid, _ in named_custom:
+                    per_category.setdefault(cid, "skipped")
+                break
+
+        # Custom NL criteria next.
+        if matched_label is None:
+            for cid, ctext in named_custom:
+                r = self.granite.classify_one(
+                    text=text, direction=direction, criterion_text=ctext
+                )
+                score = r["score"]
+                per_category[cid] = score
+                if score == "yes":
+                    matched_label = cid
+                    for other_cid, _ in named_custom:
+                        per_category.setdefault(other_cid, "skipped")
+                    break
+
         return {
-            "verdict": "unsafe" if unsafe else "safe",
-            "label": label,
+            "verdict": "unsafe" if matched_label else "safe",
+            "label": matched_label,
             "per_category": per_category,
             "engine": "granite",
-            "mode": "combined_custom",
+            "mode": "per_criterion",
         }
 
     # --- Qwen path (built-in only) ----------------------------------------

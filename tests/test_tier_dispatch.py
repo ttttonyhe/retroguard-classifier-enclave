@@ -101,7 +101,9 @@ class TestCustomCriteriaRouting:
             protection_effort=tier,
             custom_criteria=[{"id": "c1", "text": "no internal codenames"}],
         )
-        mocks["granite"].classify_one.assert_called_once()
+        # Per-criterion eval: one Granite call per criterion (1 builtin + 1
+        # custom = 2 here, since none returned 'yes' to short-circuit).
+        assert mocks["granite"].classify_one.call_count >= 1
         # And no Qwen engine got the request.
         for label in ("qwen_06b", "qwen_4b", "qwen_8b"):
             mocks[label].classify_native.assert_not_called()
@@ -178,6 +180,11 @@ class TestQwenDispatchSemantics:
 
 
 class TestGraniteCustomDispatch:
+    """Per-criterion BYOC eval: built-in categories are evaluated FIRST,
+    custom rules NEXT, both in declared order. Short-circuits on the
+    first 'yes'. Matches IBM's spec — one criterion per
+    apply_chat_template call."""
+
     def test_granite_safe_returns_safe(self) -> None:
         c, _ = _classifier(granite_score="no")
         r = c.classify(
@@ -188,9 +195,13 @@ class TestGraniteCustomDispatch:
         )
         assert r["verdict"] == "safe"
         assert r["engine"] == "granite"
+        assert r["per_category"]["harm"] == "no"
+        assert r["per_category"]["c1"] == "no"
 
-    def test_granite_unsafe_attributes_to_first_custom_criterion(self) -> None:
-        c, _ = _classifier(granite_score="yes")
+    def test_granite_unsafe_short_circuits_on_first_builtin(self) -> None:
+        """All Granite calls return 'yes' — the first criterion (a
+        built-in: 'harm') wins, custom rules are marked 'skipped'."""
+        c, mocks = _classifier(granite_score="yes")
         r = c.classify(
             text="x",
             direction="input",
@@ -201,16 +212,33 @@ class TestGraniteCustomDispatch:
             ],
         )
         assert r["verdict"] == "unsafe"
-        assert r["label"] == "c-no-codenames"
-        # And every enabled criterion shows in per_category as ambiguous.
-        assert r["per_category"]["c-no-codenames"] == "?"
-        assert r["per_category"]["c-no-pii"] == "?"
-        assert r["per_category"]["harm"] == "?"
+        # Builtins evaluated first → 'harm' fires before custom criteria
+        # are even visited.
+        assert r["label"] == "harm"
+        assert r["per_category"]["harm"] == "yes"
+        assert r["per_category"]["c-no-codenames"] == "skipped"
+        assert r["per_category"]["c-no-pii"] == "skipped"
+        # And only ONE Granite call should have happened (the harm one).
+        assert mocks["granite"].classify_one.call_count == 1
 
-    def test_granite_unsafe_with_no_custom_falls_back_to_first_builtin(self) -> None:
-        # Edge case: empty custom_criteria text with non-empty list shape
-        # collapses through the noop check, so this path needs at least
-        # one well-formed custom entry to reach Granite.
+    def test_granite_unsafe_attributes_to_specific_custom_when_only_custom(self) -> None:
+        """No built-ins, multiple custom — first custom criterion wins."""
+        c, mocks = _classifier(granite_score="yes")
+        r = c.classify(
+            text="x",
+            direction="input",
+            categories=[],
+            custom_criteria=[
+                {"id": "c-no-codenames", "text": "no codenames"},
+                {"id": "c-no-pii", "text": "no PII"},
+            ],
+        )
+        assert r["verdict"] == "unsafe"
+        assert r["label"] == "c-no-codenames"
+        assert r["per_category"]["c-no-codenames"] == "yes"
+        assert r["per_category"]["c-no-pii"] == "skipped"
+
+    def test_granite_unsafe_with_first_builtin_in_list(self) -> None:
         c, _ = _classifier(granite_score="yes")
         r = c.classify(
             text="x",
@@ -219,5 +247,5 @@ class TestGraniteCustomDispatch:
             custom_criteria=[{"id": "c1", "text": "rule"}],
         )
         assert r["verdict"] == "unsafe"
-        # First custom wins as label.
-        assert r["label"] == "c1"
+        # 'jailbreaking' is first in the list → it wins.
+        assert r["label"] == "jailbreaking"
