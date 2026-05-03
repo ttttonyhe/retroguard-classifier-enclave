@@ -42,6 +42,15 @@ ARG QWEN_06B_SHA256=""
 ARG QWEN_4B_SHA256=""
 ARG QWEN_8B_SHA256=""
 
+# Source-provenance binding: the git commit this image was built from.
+# Baked as ENV so it ends up in the EIF (and therefore measured by PCR0).
+# Customers reading /v1/attestation can match this against the public
+# mirror's commit log and confirm the running binary corresponds to a
+# specific, reviewable source state.
+ARG GIT_COMMIT="unknown"
+ARG GIT_TAG=""
+ARG BUILD_DATE=""
+
 ENV PYTHONPATH=/app/src:/usr/local/lib/python3.12/site-packages \
     RG_LOAD_PORT=5006 \
     RG_VSOCK_PORT=5005 \
@@ -51,7 +60,10 @@ ENV PYTHONPATH=/app/src:/usr/local/lib/python3.12/site-packages \
     RG_GRANITE_SHA256=${GRANITE_SHA256} \
     RG_QWEN_06B_SHA256=${QWEN_06B_SHA256} \
     RG_QWEN_4B_SHA256=${QWEN_4B_SHA256} \
-    RG_QWEN_8B_SHA256=${QWEN_8B_SHA256}
+    RG_QWEN_8B_SHA256=${QWEN_8B_SHA256} \
+    RG_BUILD_GIT_COMMIT=${GIT_COMMIT} \
+    RG_BUILD_GIT_TAG=${GIT_TAG} \
+    RG_BUILD_DATE=${BUILD_DATE}
 
 # Use absolute interpreter path so the enclave init's exec doesn't
 # accidentally pick a different python from PATH.
