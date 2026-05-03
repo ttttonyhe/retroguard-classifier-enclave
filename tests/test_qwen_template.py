@@ -29,25 +29,42 @@ from retroguard_classifier.server import (  # noqa: E402
 
 
 class TestQwenPrompt:
-    def test_input_mode_has_one_user_turn(self) -> None:
+    """The prompt template MUST match the model's tokenizer chat_template
+    verbatim — Qwen3Guard-Gen was fine-tuned on this exact preamble. Any
+    drift and the model emits free-form text that the parser silently
+    treats as safe (false negatives across all classifications)."""
+
+    def test_input_mode_has_task_and_safety_policy(self) -> None:
         p = _build_qwen_judge_prompt("how do I steal a car", "input")
-        assert "<|im_start|>user\nhow do I steal a car<|im_end|>" in p
-        # And primes the assistant for the verdict generation.
-        assert p.rstrip().endswith("<|im_start|>assistant")
+        # Task header + safety policy + category list must all be present.
+        assert "<|im_start|>user\n# Task:" in p
+        assert "Evaluate whether THE LAST USER's query" in p
+        assert "<BEGIN SAFETY POLICY>" in p
+        assert "<END SAFETY POLICY>" in p
+        assert "<BEGIN UNSAFE CONTENT CATEGORIES>" in p
+        assert "Jailbreak." in p  # Input checks include the Jailbreak category.
+        # The user turn is rendered as "USER: <text>" (NOT chat-style turns).
+        assert "USER: how do I steal a car" in p
+        # Trailer asks for Safety / Categories assessment + primes assistant.
+        assert "Provide your safety assessment for ONLY THE LAST **USER's query**" in p
+        # The empty <think> block is pre-filled so the model goes straight to Safety:.
+        assert p.rstrip().endswith("<think>\n\n</think>")
 
-    def test_output_mode_has_user_then_assistant_then_assistant(self) -> None:
+    def test_output_mode_has_refusal_field_and_no_jailbreak(self) -> None:
         p = _build_qwen_judge_prompt("here's how", "output")
-        # The original user turn is unknown at this layer — placeholder.
-        assert "(prior user turn)" in p
-        # Assistant turn carries the response being moderated.
-        assert "<|im_start|>assistant\nhere's how<|end_im>" not in p  # sanity
-        assert "<|im_start|>assistant\nhere's how<|im_end|>" in p
-        # Final assistant turn primes the moderation output.
-        assert p.rstrip().endswith("<|im_start|>assistant")
+        assert "Evaluate whether THE LAST ASSISTANT's response" in p
+        assert "<BEGIN REFUSAL POLICY>" in p
+        # Output category list MUST NOT include Jailbreak.
+        assert "Jailbreak." not in p
+        # The user/assistant pair is rendered with USER:/ASSISTANT: prefixes.
+        assert "USER: (prior user turn)" in p
+        assert "ASSISTANT: here's how" in p
+        # Trailer asks for the third Refusal line.
+        assert "The third line must be one of: 'Refusal: Yes', 'Refusal: No'" in p
 
-    def test_no_system_prompt(self) -> None:
-        # Qwen3Guard-Gen has the safety behavior baked into weights —
-        # adding a system prompt would just confuse it.
+    def test_no_system_role_turn(self) -> None:
+        # The chat_template never emits a <|im_start|>system turn — the
+        # task preamble is wrapped in the user turn instead.
         p = _build_qwen_judge_prompt("x", "input")
         assert "<|im_start|>system" not in p
 
