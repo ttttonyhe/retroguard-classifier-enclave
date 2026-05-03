@@ -40,6 +40,13 @@ from pathlib import Path
 from typing import Any
 
 from retroguard_classifier import nsm
+from retroguard_classifier.upstream import (
+    DEFAULT_UPSTREAM_PORTS,
+    HttpReader,
+    HttpError,
+    open_tls_over_vsock,
+    send_request,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("enclave")
@@ -232,11 +239,12 @@ def _stream_encrypted_blob(
 ) -> None:
     """Receive [8-byte BE length][12-byte IV][ciphertext][16-byte tag], decrypt to `dest`.
 
-    AES-256-GCM with the provided data_key. We decrypt fully in memory so
-    the GCM tag covers the whole stream — large but bounded by the model
-    file size (~5 GB) and our per-enclave RAM budget (~32 GiB).
+    AES-256-GCM with the provided data_key. We stream-decrypt directly
+    to disk + a hashing context — never materializing the full 5 GiB
+    plaintext in memory. The GCM tag is verified at the end via
+    `finalize_with_tag`; if it fails, the partial file is removed.
     """
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # type: ignore[import-not-found]
 
     framed_len = int.from_bytes(_recv_exact(conn, 8), "big")
     if framed_len < 12 + 16:
@@ -246,39 +254,60 @@ def _stream_encrypted_blob(
     iv = _recv_exact(conn, 12)
     payload_len = framed_len - 12 - 16
 
+    h = hashlib.sha256()
     received = 0
     t0 = time.monotonic()
     buf = bytearray(RECV_CHUNK)
     mv = memoryview(buf)
-    chunks: list[bytes] = []
-    while received < payload_len:
-        want = min(RECV_CHUNK, payload_len - received)
-        m = conn.recv_into(mv[:want], want, socket.MSG_WAITALL)
-        if m == 0:
-            raise ConnectionError(f"peer closed mid-{label}: {received}/{payload_len}")
-        chunks.append(bytes(mv[:m]))
-        received += m
-
-    tag = _recv_exact(conn, 16)
-    ciphertext = b"".join(chunks) + tag
-
-    aes = AESGCM(data_key)
-    plaintext = aes.decrypt(iv, ciphertext, None)
-    elapsed = time.monotonic() - t0
-    digest = hashlib.sha256(plaintext).hexdigest()
-    log.info("decrypted %s in %.1fs sha256=%s", label, elapsed, digest)
 
     if not expected_sha256:
         raise RuntimeError(
             f"refusing to load {label}: no SHA-256 baked into EIF "
             f"(set RG_{label.upper()}_SHA256 at build time)"
         )
+
+    decryptor = Cipher(algorithms.AES(data_key), modes.GCM(iv)).decryptor()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("wb") as fout:
+        try:
+            while received < payload_len:
+                want = min(RECV_CHUNK, payload_len - received)
+                m = conn.recv_into(mv[:want], want, socket.MSG_WAITALL)
+                if m == 0:
+                    raise ConnectionError(f"peer closed mid-{label}: {received}/{payload_len}")
+                pt = decryptor.update(bytes(mv[:m]))
+                if pt:
+                    fout.write(pt)
+                    h.update(pt)
+                received += m
+
+            tag = _recv_exact(conn, 16)
+            tail = decryptor.finalize_with_tag(tag)
+            if tail:
+                fout.write(tail)
+                h.update(tail)
+        except Exception:
+            # Partial plaintext on disk could be mistaken for a valid
+            # model on a subsequent boot — wipe it on any failure.
+            fout.close()
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            raise
+
+    digest = h.hexdigest()
+    elapsed = time.monotonic() - t0
+    log.info("decrypted %s in %.1fs sha256=%s", label, elapsed, digest)
+
     if digest != expected_sha256:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
         raise RuntimeError(
             f"{label} plaintext digest mismatch: got {digest}, expected {expected_sha256}"
         )
-
-    dest.write_bytes(plaintext)
 
 
 def _load_models_from_parent() -> None:
@@ -432,6 +461,184 @@ def _read_line_byte(conn: socket.socket) -> str | None:
     return out.decode("utf-8", errors="replace")
 
 
+_PROVIDER_ROUTING: dict[str, dict[str, Any]] = {
+    "openai": {
+        "host": "api.openai.com",
+        "path": "/v1/chat/completions",
+        "auth_header": "Authorization",
+        "auth_format": "Bearer {key}",
+        "extra_headers": {},
+    },
+    "anthropic": {
+        "host": "api.anthropic.com",
+        "path": "/v1/messages",
+        "auth_header": "x-api-key",
+        "auth_format": "{key}",
+        "extra_headers": {"anthropic-version": "2023-06-01"},
+    },
+}
+
+
+def _send_frame(conn: socket.socket, payload: dict[str, Any]) -> None:
+    conn.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+
+
+def _handle_chat(conn: socket.socket, msg: dict[str, Any]) -> None:
+    log.info("op:chat received request_id=%s provider=%s stream=%s",
+             msg.get("request_id"), msg.get("provider"), msg.get("stream"))
+    """Proxy a chat completion through to the upstream provider.
+
+    Wire (parent → enclave):
+        {"op":"chat","request_id":...,"recipient_ciphertext_b64":...,
+         "provider":"openai|anthropic","body":{...},"stream":bool}
+
+    Wire (enclave → parent), one or more newline-delimited frames:
+        Buffered: {"event":"buffered","status":int,"body":{...}}
+        Streaming: {"event":"start","status":int}
+                   {"event":"chunk","sse_line":"data: ..."}
+                   ... (repeated)
+                   {"event":"done"}
+        Errors:   {"event":"error","message":str,"upstream_status":int|None}
+    """
+    request_id = msg.get("request_id", "")
+    provider = msg.get("provider", "")
+    body = msg.get("body") or {}
+    is_stream = bool(msg.get("stream", False))
+    recipient_ct_b64 = msg.get("recipient_ciphertext_b64") or ""
+
+    routing = _PROVIDER_ROUTING.get(provider)
+    if routing is None:
+        _send_frame(conn, {"event": "error", "request_id": request_id, "message": f"unknown provider: {provider}"})
+        return
+    if not recipient_ct_b64:
+        _send_frame(conn, {"event": "error", "request_id": request_id, "message": "missing recipient_ciphertext_b64"})
+        return
+
+    # 1. Recover the customer's plaintext API key. Lives in this stack frame
+    # only; we don't log it, don't forward it back to the parent.
+    try:
+        recipient_ct = base64.b64decode(recipient_ct_b64)
+        log.info("op:chat unwrapping recipient_ct len=%d", len(recipient_ct))
+        api_key = nsm.unwrap_kms_recipient_ciphertext(recipient_ct).decode("utf-8")
+        log.info("op:chat unwrap ok api_key_prefix=%s", api_key[:6] + "***")
+    except Exception as exc:
+        log.exception("op:chat recipient_unwrap_failed: %s", exc)
+        _send_frame(conn, {"event": "error", "request_id": request_id, "message": f"recipient_unwrap_failed: {exc}"})
+        return
+
+    # 2. Open a TLS-over-vsock socket to the upstream via the parent's vsock-proxy.
+    upstream_host = routing["host"]
+    vsock_port = DEFAULT_UPSTREAM_PORTS.get(upstream_host)
+    if vsock_port is None:
+        _send_frame(conn, {"event": "error", "request_id": request_id, "message": f"no vsock_port for {upstream_host}"})
+        return
+    try:
+        log.info("op:chat opening TLS over vsock host=%s vsock_port=%d", upstream_host, vsock_port)
+        tls = open_tls_over_vsock(upstream_host=upstream_host, vsock_port=vsock_port)
+        log.info("op:chat TLS handshake ok")
+    except Exception as exc:
+        log.exception("op:chat vsock_tls_open_failed")
+        _send_frame(conn, {"event": "error", "request_id": request_id, "message": f"vsock_tls_open_failed: {exc}"})
+        return
+
+    try:
+        # 3. Build + send the upstream request. Force `stream` to match what
+        # the parent asked for so the response framing is consistent.
+        request_body = {**body, "stream": is_stream}
+        body_bytes = json.dumps(request_body, separators=(",", ":")).encode("utf-8")
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if is_stream else "application/json",
+            routing["auth_header"]: routing["auth_format"].format(key=api_key),
+            **routing["extra_headers"],
+        }
+        log.info("op:chat sending POST %s body_len=%d", routing["path"], len(body_bytes))
+        send_request(
+            tls,
+            method="POST",
+            path=routing["path"],
+            host=upstream_host,
+            headers=headers,
+            body=body_bytes,
+        )
+
+        # Burn the api_key local; it's been written to the TLS socket already.
+        api_key = ""
+
+        # 4. Parse response head.
+        reader = HttpReader(tls)
+        try:
+            log.info("op:chat reading response status")
+            status = reader.read_status()
+            log.info("op:chat upstream status=%d", status)
+            response_headers = reader.read_headers()
+            log.info("op:chat got %d response headers", len(response_headers))
+        except HttpError as exc:
+            _send_frame(conn, {"event": "error", "request_id": request_id, "message": f"upstream_head_read_failed: {exc}"})
+            return
+
+        # 5. Stream or buffer body back through vsock.
+        is_chunked = response_headers.get("transfer-encoding", "").lower() == "chunked"
+        content_length_str = response_headers.get("content-length")
+
+        if is_stream:
+            _send_frame(conn, {"event": "start", "request_id": request_id, "status": status})
+            try:
+                if is_chunked:
+                    leftover = b""
+                    for chunk in reader.iter_chunked():
+                        # An SSE chunk may contain one or more events; split on \n\n.
+                        # Buffer leftover bytes from the previous chunk to re-stitch.
+                        leftover += chunk
+                        while b"\n\n" in leftover:
+                            event, _, leftover = leftover.partition(b"\n\n")
+                            text = event.decode("utf-8", errors="replace")
+                            for line in text.splitlines():
+                                if line:
+                                    _send_frame(conn, {"event": "chunk", "request_id": request_id, "sse_line": line})
+                    if leftover:
+                        text = leftover.decode("utf-8", errors="replace")
+                        for line in text.splitlines():
+                            if line:
+                                _send_frame(conn, {"event": "chunk", "request_id": request_id, "sse_line": line})
+                else:
+                    # Some upstreams return non-chunked SSE — read until close, split.
+                    raw = reader.read_until_close()
+                    text = raw.decode("utf-8", errors="replace")
+                    for line in text.splitlines():
+                        if line:
+                            _send_frame(conn, {"event": "chunk", "request_id": request_id, "sse_line": line})
+            except HttpError as exc:
+                _send_frame(conn, {"event": "error", "request_id": request_id, "message": f"upstream_body_read_failed: {exc}", "upstream_status": status})
+                return
+            _send_frame(conn, {"event": "done", "request_id": request_id})
+        else:
+            try:
+                if is_chunked:
+                    body_buf = bytearray()
+                    for chunk in reader.iter_chunked():
+                        body_buf.extend(chunk)
+                    raw = bytes(body_buf)
+                elif content_length_str is not None:
+                    raw = reader.read_fixed(int(content_length_str))
+                else:
+                    raw = reader.read_until_close()
+            except (HttpError, ValueError) as exc:
+                _send_frame(conn, {"event": "error", "request_id": request_id, "message": f"upstream_body_read_failed: {exc}", "upstream_status": status})
+                return
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                _send_frame(conn, {"event": "error", "request_id": request_id, "message": f"upstream_body_parse_failed: {exc}", "upstream_status": status})
+                return
+            _send_frame(conn, {"event": "buffered", "request_id": request_id, "status": status, "body": payload})
+    finally:
+        try:
+            tls.close()
+        except OSError:
+            pass
+
+
 def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
     try:
         while True:
@@ -449,7 +656,14 @@ def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
                 t0 = time.monotonic()
                 user_data = _decode_b64(msg.get("user_data_b64"))
                 nonce = _decode_b64(msg.get("nonce_b64"))
-                public_key = _decode_b64(msg.get("public_key_b64"))
+                # When the parent is going to use this doc as a KMS Decrypt
+                # Recipient, it asks for the enclave's own RSA pubkey to be
+                # baked in — KMS will return ciphertext-for-recipient that
+                # only this running enclave's matching priv key can unwrap.
+                if msg.get("embed_recipient_pubkey"):
+                    public_key = nsm.get_recipient_public_key_der()
+                else:
+                    public_key = _decode_b64(msg.get("public_key_b64"))
                 try:
                     doc = nsm.get_attestation_document(
                         user_data=user_data, nonce=nonce, public_key=public_key
@@ -465,6 +679,10 @@ def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
                         "error": f"nsm_attest_failed: {exc}",
                     }
                 conn.sendall((json.dumps(payload) + "\n").encode())
+                continue
+
+            if op == "chat":
+                _handle_chat(conn, msg)
                 continue
 
             if op != "classify":
@@ -494,6 +712,8 @@ def _serve_one(conn: socket.socket, classifier: DualClassifier) -> None:
 
 
 def main() -> int:
+    import threading
+
     log.info("python=%s exe=%s", sys.version.split()[0], sys.executable)
     log.info("sys.path[:5]=%s", sys.path[:5])
     _load_models_from_parent()
@@ -504,13 +724,19 @@ def main() -> int:
 
     sock = socket.socket(AF_VSOCK, socket.SOCK_STREAM)
     sock.bind((VMADDR_CID_ANY, CLASSIFY_PORT))
-    sock.listen(8)
+    sock.listen(64)
     log.info("listening on vsock cid=ANY port=%d", CLASSIFY_PORT)
 
     while True:
         conn, addr = sock.accept()
         log.info("accepted from cid=%s port=%s", addr[0], addr[1])
-        _serve_one(conn, classifier)
+        # Each parent-side client (NsmAttestationClient, VsockClassifier,
+        # VsockChatClient) keeps a long-lived vsock connection. Without
+        # threading, the first connection blocks the listener forever and
+        # no other client can talk to us. Daemon thread per connection.
+        threading.Thread(
+            target=_serve_one, args=(conn, classifier), daemon=True
+        ).start()
 
 
 if __name__ == "__main__":

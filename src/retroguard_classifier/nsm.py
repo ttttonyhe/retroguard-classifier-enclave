@@ -138,14 +138,62 @@ def get_recipient_public_key_der() -> bytes:
 
 
 def unwrap_kms_recipient_ciphertext(ciphertext_for_recipient: bytes) -> bytes:
-    """Decrypt KMS's `CiphertextForRecipient` using the matching private key.
+    """Decrypt KMS's `CiphertextForRecipient` (CMS EnvelopedData).
 
-    KMS encrypts with RSAES_OAEP_SHA_256 + MGF1-SHA256 when
-    `KeyEncryptionAlgorithm: 'RSAES_OAEP_SHA_256'` is set on the
-    Decrypt request — match that exactly.
+    AWS KMS doesn't return the plaintext re-encrypted directly with the
+    enclave's RSA pubkey. Instead it returns a CMS (PKCS#7) envelope:
+
+        ContentInfo
+          contentType: id-envelopedData
+          content: EnvelopedData
+            recipientInfos[0].ktri.encryptedKey  ← RSA-OAEP-SHA-256(AES_KEY)
+            encryptedContentInfo
+              contentEncryptionAlgorithm: aes256-GCM (params: iv + tag length)
+              encryptedContent              ← AES-GCM(plaintext) || tag
+
+    To unwrap:
+      1. ASN.1-parse the envelope
+      2. RSA-OAEP-SHA-256 decrypt `encryptedKey` → AES_KEY (32 bytes)
+      3. AES-256-GCM decrypt `encryptedContent` with that AES_KEY +
+         the IV from the algorithm parameters → plaintext
+
+    `cryptography` ships AES-GCM but not CMS parsing; we add a tiny
+    pure-Python `asn1crypto` import for the structure walk. No new C
+    deps.
     """
+    from asn1crypto.cms import ContentInfo  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.padding import PKCS7  # type: ignore[import-not-found]
+
     priv, _ = _ensure_keypair()
-    return priv.decrypt(
-        ciphertext_for_recipient,
+
+    info = ContentInfo.load(ciphertext_for_recipient)
+    if info["content_type"].native != "enveloped_data":
+        raise RuntimeError(f"unexpected CMS content_type: {info['content_type'].native!r}")
+    enveloped = info["content"]
+    recipients = enveloped["recipient_infos"]
+    if len(recipients) != 1:
+        raise RuntimeError(f"expected exactly one CMS recipient, got {len(recipients)}")
+    ri = recipients[0].chosen  # KeyTransRecipientInfo
+    enc_key = ri["encrypted_key"].native  # bytes — the RSA-OAEP-wrapped AES key
+
+    aes_key = priv.decrypt(
+        enc_key,
         OAEP(mgf=MGF1(algorithm=SHA256()), algorithm=SHA256(), label=None),
     )
+
+    eci = enveloped["encrypted_content_info"]
+    alg = eci["content_encryption_algorithm"]
+    alg_name = alg["algorithm"].native
+    if alg_name != "aes256_cbc":
+        raise RuntimeError(f"unexpected content encryption alg: {alg_name!r}")
+    # AES-CBC parameters are just the 16-byte IV as an OCTET STRING.
+    iv = alg["parameters"].native
+    if not isinstance(iv, (bytes, bytearray)) or len(iv) != 16:
+        raise RuntimeError(f"bad CBC IV: {type(iv)} len={len(iv) if iv else 0}")
+
+    cbc_ct = eci["encrypted_content"].native
+    decryptor = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).decryptor()
+    padded = decryptor.update(cbc_ct) + decryptor.finalize()
+    unpadder = PKCS7(128).unpadder()
+    return unpadder.update(padded) + unpadder.finalize()

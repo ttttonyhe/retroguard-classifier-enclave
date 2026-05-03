@@ -38,20 +38,30 @@ CHUNK = 1 << 16
 def _aes_gcm_encrypt_to_file(src: Path, dst: Path, key: bytes) -> None:
     """Encrypt `src` with AES-256-GCM to `dst` as IV||ciphertext||tag.
 
-    cryptography's AESGCM is one-shot — fine for ~5 GB models on a host
-    with 32+ GiB RAM, which is the only place this runs.
+    Streams in 4 MiB chunks so multi-GB GGUFs don't blow through the
+    `cryptography.hazmat.primitives.ciphers.aead.AESGCM` 2 GiB single-
+    shot limit. AES-GCM itself is safe up to ~64 GiB per key/IV, well
+    above any model we ship.
     """
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # type: ignore[import-not-found]
 
     iv = secrets.token_bytes(12)  # 96-bit IV is the GCM default
-    plaintext = src.read_bytes()
-    aes = AESGCM(key)
-    ct_with_tag = aes.encrypt(iv, plaintext, None)
-    # cryptography appends the 16-byte tag at the end of ct_with_tag.
-    with dst.open("wb") as f:
-        f.write(iv)
-        f.write(ct_with_tag)
-    print(f"[{src.name}] {len(plaintext)} pt → {dst.stat().st_size} ct ({dst})", flush=True)
+    encryptor = Cipher(algorithms.AES(key), modes.GCM(iv)).encryptor()
+    chunk_size = 4 * 1024 * 1024  # 4 MiB
+
+    src_size = src.stat().st_size
+    written = 0
+    with src.open("rb") as fin, dst.open("wb") as fout:
+        fout.write(iv)
+        while True:
+            chunk = fin.read(chunk_size)
+            if not chunk:
+                break
+            fout.write(encryptor.update(chunk))
+            written += len(chunk)
+        fout.write(encryptor.finalize())
+        fout.write(encryptor.tag)  # 16 bytes appended after ciphertext
+    print(f"[{src.name}] {src_size} pt → {dst.stat().st_size} ct ({dst})", flush=True)
 
 
 def main() -> int:
