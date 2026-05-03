@@ -55,22 +55,18 @@ LOAD_PORT = int(os.environ.get("RG_LOAD_PORT", "5006"))
 CLASSIFY_PORT = int(os.environ.get("RG_VSOCK_PORT", "5005"))
 MODEL_DIR = Path(os.environ.get("RG_MODEL_DIR", "/tmp/models"))
 GRANITE_PATH = MODEL_DIR / "granite-guardian.gguf"
-QWEN_PATH = MODEL_DIR / "qwen3guard.gguf"
 GRANITE_SHA256 = os.environ.get("RG_GRANITE_SHA256", "").lower()
-QWEN_SHA256 = os.environ.get("RG_QWEN_SHA256", "").lower()
 MODEL_CTX = int(os.environ.get("RG_MODEL_CTX", "4096"))
 MODEL_THREADS = int(os.environ.get("RG_MODEL_THREADS", "32"))
 
 
-def _build_granite_prompt(text: str, direction: str) -> str:
-    """Granite Guardian chat template (single-token verdict).
+def _build_safety_prompt(text: str, direction: str) -> str:
+    """Single-token Yes/No verdict prompt for the safety classifier.
 
-    IBM's recommended usage drives the model to a one-token "Yes"/"No"
-    verdict per risk, not the multi-category enumeration our earlier
-    prompt asked for. Trimming the system message (~100 → ~25 tokens of
-    prompt overhead) cut warm latency from ~2.3 s to ~0.6 s in our
-    benchmarks. Categories beyond a generic "harm" label are produced
-    by Qwen3Guard on the output path.
+    Trimming to ~25 tokens of prompt overhead drops warm-path latency
+    by ~4x vs the original multi-category template. The classifier is
+    used for both input + output checks; direction just changes which
+    side of the conversation we describe.
     """
     speaker = "user" if direction == "input" else "assistant"
     return (
@@ -79,19 +75,6 @@ def _build_granite_prompt(text: str, direction: str) -> str:
         "<|end_of_text|>\n"
         f"<|start_of_role|>{speaker}<|end_of_role|>{text}<|end_of_text|>\n"
         "<|start_of_role|>assistant<|end_of_role|>"
-    )
-
-
-def _build_qwen3guard_prompt(text: str, direction: str) -> str:
-    """Qwen3Guard-Gen chat template (ChatML)."""
-    role = "user" if direction == "input" else "assistant"
-    return (
-        "<|im_start|>system\n"
-        "You are a safety guardrail. Classify the following message for harmful "
-        "content. Respond with 'safe' or 'unsafe' on the first line. If unsafe, "
-        "list violated categories on the second line.\n<|im_end|>\n"
-        f"<|im_start|>{role}\n{text}<|im_end|>\n"
-        "<|im_start|>assistant\n"
     )
 
 
@@ -145,34 +128,28 @@ class GuardrailEngine:
 
 
 class DualClassifier:
-    """Routes to Granite (input) or Qwen3Guard (output) per spec §3.
+    """Single-engine classifier serving both input + output checks.
 
-    If only Granite is loaded (Qwen path missing), falls back to Granite
-    for both directions.
+    Historically routed input → Granite, output → Qwen3Guard-Gen.
+    Qwen3Guard-Gen was dropped (no token-by-token streaming support
+    under llama-cpp; the streaming-capable variant needs a different
+    inference runtime). Both directions now go through Granite, which
+    parallelizes well enough that the streaming handler (`handle_stream`)
+    can run output checks asynchronously off the token-forwarding hot
+    path. The class name is preserved for compatibility with callers.
     """
 
     def __init__(self) -> None:
-        self.granite = GuardrailEngine(
-            "granite-guardian", GRANITE_PATH, _build_granite_prompt,
+        self.engine = GuardrailEngine(
+            "safety-classifier", GRANITE_PATH, _build_safety_prompt,
             stop_tokens=["<|end_of_text|>", "</s>"],
             max_tokens=4,
             default_label="harm",
         )
-        self.qwen: GuardrailEngine | None = None
-        if QWEN_PATH.exists():
-            self.qwen = GuardrailEngine(
-                "qwen3guard-gen", QWEN_PATH, _build_qwen3guard_prompt,
-                stop_tokens=["<|im_end|>", "</s>"],
-                max_tokens=24,
-                default_label="harm",
-            )
-            log.info("dual-classifier mode: granite + qwen3guard")
-        else:
-            log.info("single-classifier mode: granite only (qwen path missing)")
+        log.info("safety classifier loaded (single-engine mode)")
 
     def classify(self, text: str, direction: str) -> dict[str, Any]:
-        engine = self.granite if (direction == "input" or self.qwen is None) else self.qwen
-        return engine.classify(text, direction)
+        return self.engine.classify(text, direction)
 
 
 # Linux 4.14 (the kernel baked into nitro-cli's bzImage) has a virtio_vsock
@@ -358,15 +335,12 @@ def _load_models_from_parent() -> None:
         mode = header.get("mode", "plaintext")
         if mode == "plaintext":
             _stream_blob(conn, GRANITE_PATH, GRANITE_SHA256, "granite")
-            _stream_blob(conn, QWEN_PATH, QWEN_SHA256, "qwen")
         elif mode == "kms":
             data_key = _negotiate_kms_data_key(conn, header)
             _stream_encrypted_blob(conn, GRANITE_PATH, data_key, GRANITE_SHA256, "granite")
-            _stream_encrypted_blob(conn, QWEN_PATH, data_key, QWEN_SHA256, "qwen")
         else:
             raise RuntimeError(f"unknown load mode: {mode!r}")
 
-        # Acknowledge so the parent knows both blobs were verified.
         conn.sendall(b'{"status":"loaded"}\n')
     finally:
         try:

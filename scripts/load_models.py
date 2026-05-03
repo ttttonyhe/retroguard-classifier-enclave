@@ -165,41 +165,37 @@ def main() -> int:
     p.add_argument("--port", type=int, default=5006)
     p.add_argument("--mode", choices=["plaintext", "kms"], default="plaintext")
     p.add_argument("--granite", type=Path, required=False)
-    p.add_argument("--qwen", type=Path, required=False)
     # KMS-mode only:
     p.add_argument("--kms-key-id", help="ARN/ID of the KMS CMK that wraps the data key")
     p.add_argument("--encrypted-data-key", type=Path, help="File containing the KMS-wrapped data key")
     p.add_argument("--encrypted-granite", type=Path, help="AES-GCM ciphertext of granite GGUF (IV||ct||tag)")
-    p.add_argument("--encrypted-qwen", type=Path, help="AES-GCM ciphertext of qwen GGUF (IV||ct||tag)")
     p.add_argument("--region", default=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
     p.add_argument("--nonce-hex", help="Optional nonce to bind into the attestation doc")
     p.add_argument("--print-hashes", action="store_true",
-                   help="Compute and print SHA-256 of plaintext models, then exit "
-                        "(for setting --build-arg GRANITE_SHA256/QWEN_SHA256 on the EIF).")
+                   help="Compute and print SHA-256 of the plaintext model "
+                        "(for setting --build-arg GRANITE_SHA256 on the EIF).")
     args = p.parse_args()
 
     if args.print_hashes:
-        if not args.granite or not args.qwen:
-            print("--print-hashes needs --granite and --qwen", file=sys.stderr)
+        if not args.granite:
+            print("--print-hashes needs --granite", file=sys.stderr)
             return 2
         print(f"GRANITE_SHA256={_sha256(args.granite)}")
-        print(f"QWEN_SHA256={_sha256(args.qwen)}")
         return 0
 
     if args.mode == "plaintext":
-        if not args.granite or not args.qwen:
-            print("plaintext mode needs --granite and --qwen", file=sys.stderr)
+        if not args.granite:
+            print("plaintext mode needs --granite", file=sys.stderr)
             return 2
-        for path in (args.granite, args.qwen):
-            if not path.exists():
-                print(f"missing: {path}", file=sys.stderr)
-                return 2
+        if not args.granite.exists():
+            print(f"missing: {args.granite}", file=sys.stderr)
+            return 2
     else:
-        for required in ("kms_key_id", "encrypted_data_key", "encrypted_granite", "encrypted_qwen"):
+        for required in ("kms_key_id", "encrypted_data_key", "encrypted_granite"):
             if not getattr(args, required):
                 print(f"kms mode needs --{required.replace('_', '-')}", file=sys.stderr)
                 return 2
-        for path in (args.encrypted_data_key, args.encrypted_granite, args.encrypted_qwen):
+        for path in (args.encrypted_data_key, args.encrypted_granite):
             if not path.exists():
                 print(f"missing: {path}", file=sys.stderr)
                 return 2
@@ -211,7 +207,6 @@ def main() -> int:
         if args.mode == "plaintext":
             s.sendall(b'{"mode":"plaintext"}\n')
             _send_blob(s, args.granite, "granite")
-            _send_blob(s, args.qwen, "qwen")
         else:
             nonce = bytes.fromhex(args.nonce_hex) if args.nonce_hex else None
             edk = args.encrypted_data_key.read_bytes()
@@ -223,7 +218,6 @@ def main() -> int:
                 nonce=nonce,
             )
             _send_encrypted_blob(s, args.encrypted_granite, "granite")
-            _send_encrypted_blob(s, args.encrypted_qwen, "qwen")
 
         ack = _recv_line(s)
         print(f"enclave ack: {ack!r}", flush=True)

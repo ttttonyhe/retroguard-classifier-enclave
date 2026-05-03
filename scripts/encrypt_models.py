@@ -68,7 +68,6 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--kms-key-id", required=True, help="ARN/Alias/ID of the wrapping CMK")
     p.add_argument("--granite", type=Path, required=True)
-    p.add_argument("--qwen", type=Path, required=True)
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--region", default=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
     args = p.parse_args()
@@ -90,13 +89,10 @@ def main() -> int:
 
     try:
         _aes_gcm_encrypt_to_file(args.granite, args.out_dir / "granite.gcm", plaintext_dk)
-        _aes_gcm_encrypt_to_file(args.qwen, args.out_dir / "qwen.gcm", plaintext_dk)
     finally:
-        # Best-effort wipe of the in-memory key (Python's GC will collect
-        # the bytes object eventually; this just shortens the window).
         del plaintext_dk
 
-    print("[done] ciphertext models + wrapped data key are in", args.out_dir, flush=True)
+    print("[done] ciphertext model + wrapped data key are in", args.out_dir, flush=True)
     return 0
 
 

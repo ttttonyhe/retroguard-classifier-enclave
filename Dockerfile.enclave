@@ -29,13 +29,9 @@ RUN pip install --no-cache-dir llama-cpp-python==0.3.21 cbor2==5.6.5 cryptograph
 
 COPY src/ /app/src/
 
-# Expected SHA-256 of each GGUF the parent will stream. Defaults
-# point at mradermacher's public Q4_K_M mirrors; override at build
-# time with --build-arg if you mirror the weights elsewhere.
-#
+# Expected SHA-256 of the safety-classifier GGUF the parent will stream.
 # Compute with: sha256sum granite-guardian-4.1-8b.Q4_K_M.gguf
 ARG GRANITE_SHA256=""
-ARG QWEN_SHA256=""
 
 ENV PYTHONPATH=/app/src:/usr/local/lib/python3.12/site-packages \
     RG_LOAD_PORT=5006 \
@@ -43,8 +39,7 @@ ENV PYTHONPATH=/app/src:/usr/local/lib/python3.12/site-packages \
     RG_MODEL_DIR=/tmp/models \
     RG_MODEL_CTX=4096 \
     RG_MODEL_THREADS=16 \
-    RG_GRANITE_SHA256=${GRANITE_SHA256} \
-    RG_QWEN_SHA256=${QWEN_SHA256}
+    RG_GRANITE_SHA256=${GRANITE_SHA256}
 
 # Use absolute interpreter path so the enclave init's exec doesn't
 # accidentally pick a different python from PATH.
